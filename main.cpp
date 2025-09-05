@@ -26,7 +26,7 @@
   #endif
 #endif
 
-#include "orchestrator.cpp"
+#include "orchestrator.hpp"
 #include "websocket_proxy.hpp"
 
 using json = nlohmann::json;
@@ -55,7 +55,7 @@ class ProxyMessageInterceptor : public EnhancedMessageInterceptor {
 public:
     explicit ProxyMessageInterceptor(ChunkTracker* tracker) : tracker_(tracker) {}
     void onTaskInit(const json& msg) override {
-        (void)msg; /* no-op for now */
+        (void)msg; /* hook for future task-level data */
     }
     void onChunkAssign(const json& msg) override {
         try {

@@ -14,9 +14,9 @@
 
 namespace unified_monitor {
 
-class ChunkTracker; // from orchestrator.cpp (included elsewhere)
+class ChunkTracker; // from orchestrator.hpp
 
-// Simple interface so this header provides a *complete* type callable from .cpp
+// Public interceptor interface the proxy will call into.
 class EnhancedMessageInterceptor {
 public:
     virtual ~EnhancedMessageInterceptor() = default;
@@ -25,7 +25,7 @@ public:
     virtual void onChunkResult(const nlohmann::json& msg) = 0;
 };
 
-// Lightweight Beast-based WebSocket proxy.
+// Minimal Beast-based WebSocket proxy.
 // Listens on :listen_port and forwards to upstream_host:upstream_port.
 class BeastWebSocketProxy {
 public:
@@ -36,7 +36,6 @@ public:
     void stop();
 
 private:
-    // PIMPL to keep this header stable
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::thread io_thread_;

@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "orchestrator.cpp" // pragma once; brings in ChunkMetrics, MetricsAggregator, structs
+#include "orchestrator.hpp"
 
 using namespace std::chrono;
 
@@ -28,7 +28,6 @@ MetricsAggregator::aggregateChunk(const ChunkMetrics& chunk) {
     if (t1 <= 0.0) t1 = tp_secs(Clock::now());
     out.duration_ms = (t1 - t0) * 1000.0;
 
-    // OS
     out.peak_cpu_percent = 0.0;
     out.peak_mem_mb = 0.0;
     for (const auto& os : chunk.os_samples) {
@@ -36,7 +35,6 @@ MetricsAggregator::aggregateChunk(const ChunkMetrics& chunk) {
         out.peak_mem_mb = std::max(out.peak_mem_mb, os.mem_rss_kb / 1024.0);
     }
 
-    // GPU
     out.peak_gpu_util_percent = 0.0;
     double sum_power = 0.0;
     for (const auto& g : chunk.gpu_samples) {
@@ -61,7 +59,7 @@ MetricsAggregator::aggregateTask(const std::string& task_id,
     out.avg_power_mw = 0.0;
 
     double sum_power = 0.0;
-    size_t power_samples = 0;
+    std::size_t power_samples = 0;
 
     for (const auto& ch : chunks) {
         if (ch.task_id != task_id) continue;
@@ -73,7 +71,6 @@ MetricsAggregator::aggregateTask(const std::string& task_id,
         double dur_ms = (t1 - t0) * 1000.0;
         out.total_duration_ms += dur_ms;
 
-        // naive "compute time" approximation: time between start and completion
         double ts = tp_secs(ch.start_time);
         out.total_compute_time_ms += std::max(0.0, (t1 - ts) * 1000.0);
 
@@ -114,7 +111,6 @@ void MetricsAggregator::exportTaskCSV(const std::string& filename,
     }
 }
 
-// Optional: dump regular time series for a single chunk (for debugging/plotting)
 void MetricsAggregator::exportTimeSeriesCSV(const std::string& filename,
                                             const ChunkMetrics& chunk) {
     std::ofstream f(filename);

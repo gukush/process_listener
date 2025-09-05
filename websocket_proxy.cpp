@@ -1,5 +1,5 @@
 #include "websocket_proxy.hpp"
-#include "orchestrator.cpp" // declarations for ChunkTracker (pragma once)
+#include "orchestrator.hpp"
 
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
@@ -28,7 +28,6 @@ struct BeastWebSocketProxy::Impl {
 
     std::atomic<bool> running{false};
 
-    // One proxy session per client
     struct ProxySession {
         boost::asio::io_context& ioc;
         tcp::socket client_socket;
@@ -41,8 +40,6 @@ struct BeastWebSocketProxy::Impl {
 
         std::string upstream_host;
         uint16_t upstream_port;
-
-        std::vector<char> buffer;
 
         ProxySession(boost::asio::io_context& ioc_,
                      tcp::socket&& sock,
@@ -73,7 +70,6 @@ struct BeastWebSocketProxy::Impl {
             upstream_ws.handshake(upstream_host, "/", ec);
             if (ec) { std::cerr << "[proxy] handshake error: " << ec.message() << "\n"; return; }
 
-            // Two threads: C->S and S->C pumps.
             std::thread t_cs([this]{ pump_client_to_server(); });
             std::thread t_sc([this]{ pump_server_to_client(); });
 
@@ -90,10 +86,6 @@ struct BeastWebSocketProxy::Impl {
                 auto j = nlohmann::json::parse(text, nullptr, false);
                 if (j.is_discarded()) return;
 
-                // Accept common Socket.IO-like envelopes:
-                // 1) { "event": "...", "data": {...} }
-                // 2) ["event", {...}]
-                // 3) bare message with known keys
                 auto call = [&](const std::string& ev, const nlohmann::json& payload) {
                     if (!interceptor) return;
                     if (ev == "task:init") interceptor->onTaskInit(payload);
@@ -113,7 +105,7 @@ struct BeastWebSocketProxy::Impl {
                     call(j[0].get<std::string>(), j[1]);
                 }
             } catch (...) {
-                // ignore non-json
+                // ignore
             }
         }
 
@@ -192,11 +184,21 @@ bool BeastWebSocketProxy::start(uint16_t listen_port, const std::string& upstrea
     if (impl_->running.exchange(true)) return true;
 
     beast::error_code ec;
-    auto address = boost::asio::ip::make_address("0.0.0.0", ec);
-    if (ec) { std::cerr << "[proxy] bad listen address: " << ec.message() << "\n"; return false; }
 
-    impl_->acceptor = std::make_unique<tcp::acceptor>(impl_->ioc, tcp::endpoint{address, listen_port}, ec);
-    if (ec) { std::cerr << "[proxy] acceptor error: " << ec.message() << "\n"; return false; }
+    impl_->acceptor = std::make_unique<tcp::acceptor>(impl_->ioc);
+    tcp::endpoint endpoint{tcp::v4(), listen_port};
+
+    impl_->acceptor->open(endpoint.protocol(), ec);
+    if (ec) { std::cerr << "[proxy] acceptor open: " << ec.message() << "\n"; return false; }
+
+    impl_->acceptor->set_option(boost::asio::socket_base::reuse_address(true), ec);
+    if (ec) { std::cerr << "[proxy] set_option: " << ec.message() << "\n"; return false; }
+
+    impl_->acceptor->bind(endpoint, ec);
+    if (ec) { std::cerr << "[proxy] bind: " << ec.message() << "\n"; return false; }
+
+    impl_->acceptor->listen(boost::asio::socket_base::max_listen_connections, ec);
+    if (ec) { std::cerr << "[proxy] listen: " << ec.message() << "\n"; return false; }
 
     impl_->upstream_host = upstream_host;
     impl_->upstream_port = upstream_port;

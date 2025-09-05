@@ -14,7 +14,7 @@ if(DEFINED CMAKE_TOOLCHAIN_FILE AND CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg")
 endif()
 
 # Dependencies
-# Boost: only 'system' is required (no 'thread'); we use std::thread.
+# Boost: only 'system' is required (we use std::thread)
 if(USING_VCPKG)
     find_package(Boost CONFIG REQUIRED COMPONENTS system)
 else()
@@ -27,7 +27,7 @@ if(NOT nlohmann_json_FOUND)
     find_package(nlohmann_json REQUIRED)
 endif()
 
-# Sources
+# Sources (note: we DO NOT compile orchestrator.cpp; we use orchestrator.hpp)
 set(SRCS
     main.cpp
     websocket_proxy.cpp
@@ -41,6 +41,7 @@ add_executable(unified_monitor ${SRCS})
 target_include_directories(unified_monitor
     PRIVATE
         ${Boost_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}  # for orchestrator.hpp
 )
 
 target_link_libraries(unified_monitor
@@ -52,9 +53,6 @@ target_link_libraries(unified_monitor
 
 # NVML (CUDA) wiring
 if(HAVE_CUDA)
-    # Allow manual hints:
-    #   -DNVML_INCLUDE_DIR=/path/to/include   (where nvml.h lives)
-    #   -DNVML_LIB=/path/to/libnvidia-ml.so
     if(NOT NVML_INCLUDE_DIR)
         find_path(NVML_INCLUDE_DIR nvml.h
                   HINTS /usr/include /usr/include/nvidia-ml /usr/local/cuda/include

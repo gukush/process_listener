@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "orchestrator.cpp"
+#include "orchestrator.hpp"
 
 using namespace std::chrono;
 
@@ -21,6 +21,7 @@ void ChunkTracker::exportToCSV(const std::string& filename) const {
     file << "chunk_id,task_id,arrival_time,start_time,completion_time,duration_ms,"
             "peak_cpu_percent,peak_mem_mb,peak_gpu_util_percent,avg_power_mw,samples\n";
 
+    std::lock_guard<std::mutex> lk(mx_);
     for (const auto& kv : chunks_) {
         const auto& chunk_id = kv.first;
         const auto& cm = kv.second;
@@ -31,7 +32,6 @@ void ChunkTracker::exportToCSV(const std::string& filename) const {
         if (t_end <= 0.0) t_end = tp_secs(Clock::now());
         double duration_ms = (t_end - t_arr) * 1000.0;
 
-        // OS peaks
         double peak_cpu = 0.0;
         double peak_mem_mb = 0.0;
         for (const auto& os : cm.os_samples) {
@@ -39,7 +39,6 @@ void ChunkTracker::exportToCSV(const std::string& filename) const {
             peak_mem_mb = std::max(peak_mem_mb, os.mem_rss_kb / 1024.0);
         }
 
-        // GPU peaks + avg power
         double peak_gpu_util = 0.0;
         double avg_power = 0.0;
         if (!cm.gpu_samples.empty()) {
