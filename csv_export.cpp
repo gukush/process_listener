@@ -1,95 +1,69 @@
 // csv_export.cpp
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <iomanip>
+#include <string>
+#include <vector>
+
+#include "orchestrator.cpp"
+
+using namespace std::chrono;
+
+static inline double tp_secs(const unified_monitor::Clock::time_point& tp) {
+    return duration<double>(tp.time_since_epoch()).count();
+}
+
+namespace unified_monitor {
 
 void ChunkTracker::exportToCSV(const std::string& filename) const {
     std::ofstream file(filename);
-    
-    // Header
-    file << "chunk_id,task_id,arrival_time,start_time,completion_time,"
-         << "duration_ms,status,energy_joules,avg_cpu_percent,"
-         << "peak_cpu_percent,avg_mem_mb,peak_mem_mb,avg_gpu_util,"
-         << "peak_gpu_util,avg_gpu_power_w,total_disk_read_mb,"
-         << "total_disk_write_mb,total_net_recv_mb,total_net_sent_mb\n";
-    
-    for (const auto& [chunk_id, metrics] : chunks_) {
-        double duration_ms = std::chrono::duration<double, std::milli>(
-            metrics.completion_time - metrics.arrival_time).count();
-        
-        // Calculate aggregates
-        double avg_cpu = 0, peak_cpu = 0;
-        double avg_mem_mb = 0, peak_mem_mb = 0;
-        double avg_gpu_util = 0, peak_gpu_util = 0;
-        double avg_gpu_power_w = 0;
-        
-        // Process OS metrics
-        for (const auto& os : metrics.os_samples) {
-            avg_cpu += os.cpu_percent;
+    file << "chunk_id,task_id,arrival_time,start_time,completion_time,duration_ms,"
+            "peak_cpu_percent,peak_mem_mb,peak_gpu_util_percent,avg_power_mw,samples\n";
+
+    for (const auto& kv : chunks_) {
+        const auto& chunk_id = kv.first;
+        const auto& cm = kv.second;
+
+        double t_arr = tp_secs(cm.arrival_time);
+        double t_sta = tp_secs(cm.start_time);
+        double t_end = tp_secs(cm.completion_time);
+        if (t_end <= 0.0) t_end = tp_secs(Clock::now());
+        double duration_ms = (t_end - t_arr) * 1000.0;
+
+        // OS peaks
+        double peak_cpu = 0.0;
+        double peak_mem_mb = 0.0;
+        for (const auto& os : cm.os_samples) {
             peak_cpu = std::max(peak_cpu, os.cpu_percent);
-            
-            double mem_mb = os.mem_rss_kb / 1024.0;
-            avg_mem_mb += mem_mb;
-            peak_mem_mb = std::max(peak_mem_mb, mem_mb);
+            peak_mem_mb = std::max(peak_mem_mb, os.mem_rss_kb / 1024.0);
         }
-        
-        if (!metrics.os_samples.empty()) {
-            avg_cpu /= metrics.os_samples.size();
-            avg_mem_mb /= metrics.os_samples.size();
+
+        // GPU peaks + avg power
+        double peak_gpu_util = 0.0;
+        double avg_power = 0.0;
+        if (!cm.gpu_samples.empty()) {
+            double sum_power = 0.0;
+            for (const auto& g : cm.gpu_samples) {
+                peak_gpu_util = std::max(peak_gpu_util, static_cast<double>(g.gpu_util_percent));
+                sum_power += static_cast<double>(g.power_mw);
+            }
+            avg_power = sum_power / static_cast<double>(cm.gpu_samples.size());
         }
-        
-        // Process GPU metrics
-        for (const auto& gpu : metrics.gpu_samples) {
-            avg_gpu_util += gpu.gpu_util_percent;
-            peak_gpu_util = std::max(peak_gpu_util, 
-                                     (double)gpu.gpu_util_percent);
-            avg_gpu_power_w += gpu.power_mw / 1000.0;
-        }
-        
-        if (!metrics.gpu_samples.empty()) {
-            avg_gpu_util /= metrics.gpu_samples.size();
-            avg_gpu_power_w /= metrics.gpu_samples.size();
-        }
-        
-        // Calculate totals
-        double total_disk_read_mb = 0, total_disk_write_mb = 0;
-        double total_net_recv_mb = 0, total_net_sent_mb = 0;
-        
-        if (!metrics.os_samples.empty()) {
-            const auto& last = metrics.os_samples.back();
-            const auto& first = metrics.os_samples.front();
-            
-            total_disk_read_mb = (last.disk_read_bytes - 
-                                 first.disk_read_bytes) / (1024.0 * 1024.0);
-            total_disk_write_mb = (last.disk_write_bytes - 
-                                  first.disk_write_bytes) / (1024.0 * 1024.0);
-            total_net_recv_mb = (last.net_recv_bytes - 
-                                first.net_recv_bytes) / (1024.0 * 1024.0);
-            total_net_sent_mb = (last.net_sent_bytes - 
-                                first.net_sent_bytes) / (1024.0 * 1024.0);
-        }
-        
-        // Write row
+
         file << chunk_id << ","
-             << metrics.task_id << ","
-             << std::chrono::duration<double>(
-                    metrics.arrival_time.time_since_epoch()).count() << ","
-             << std::chrono::duration<double>(
-                    metrics.start_time.time_since_epoch()).count() << ","
-             << std::chrono::duration<double>(
-                    metrics.completion_time.time_since_epoch()).count() << ","
-             << duration_ms << ","
-             << metrics.status << ","
-             << metrics.energy_joules << ","
-             << avg_cpu << ","
-             << peak_cpu << ","
-             << avg_mem_mb << ","
-             << peak_mem_mb << ","
-             << avg_gpu_util << ","
-             << peak_gpu_util << ","
-             << avg_gpu_power_w << ","
-             << total_disk_read_mb << ","
-             << total_disk_write_mb << ","
-             << total_net_recv_mb << ","
-             << total_net_sent_mb << "\n";
+             << cm.task_id << ","
+             << std::fixed << std::setprecision(6) << t_arr << ","
+             << std::fixed << std::setprecision(6) << t_sta << ","
+             << std::fixed << std::setprecision(6) << t_end << ","
+             << std::fixed << std::setprecision(3) << duration_ms << ","
+             << std::fixed << std::setprecision(2) << peak_cpu << ","
+             << std::fixed << std::setprecision(2) << peak_mem_mb << ","
+             << std::fixed << std::setprecision(2) << peak_gpu_util << ","
+             << std::fixed << std::setprecision(2) << avg_power << ","
+             << (cm.os_samples.size() + cm.gpu_samples.size())
+             << "\n";
     }
-    
-    file.close();
 }
+
+} // namespace unified_monitor

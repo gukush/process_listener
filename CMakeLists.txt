@@ -14,16 +14,14 @@ if(DEFINED CMAKE_TOOLCHAIN_FILE AND CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg")
 endif()
 
 # Dependencies
-# Boost: only need 'system' (we don't use boost_thread)
+# Boost: only 'system' is required (no 'thread'); we use std::thread.
 if(USING_VCPKG)
-    # vcpkg provides Boost in CONFIG mode
     find_package(Boost CONFIG REQUIRED COMPONENTS system)
 else()
-    # system Boost (e.g., 1.74 on Ubuntu)
     find_package(Boost REQUIRED COMPONENTS system)
 endif()
 
-# nlohmann_json: prefer CONFIG (vcpkg), otherwise normal find (system package)
+# nlohmann_json: prefer CONFIG (vcpkg), otherwise system package
 find_package(nlohmann_json CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)
     find_package(nlohmann_json REQUIRED)
@@ -36,7 +34,6 @@ set(SRCS
     csv_export.cpp
     aggregation_export.cpp
     os_metrics_linux.cpp
-    # gpu_listener.cpp  # not needed; GPU collector is implemented in main.cpp
 )
 
 add_executable(unified_monitor ${SRCS})
@@ -55,13 +52,33 @@ target_link_libraries(unified_monitor
 
 # NVML (CUDA) wiring
 if(HAVE_CUDA)
-    # Allow user to specify exact library: -DNVML_LIB=/path/to/libnvidia-ml.so
+    # Allow manual hints:
+    #   -DNVML_INCLUDE_DIR=/path/to/include   (where nvml.h lives)
+    #   -DNVML_LIB=/path/to/libnvidia-ml.so
+    if(NOT NVML_INCLUDE_DIR)
+        find_path(NVML_INCLUDE_DIR nvml.h
+                  HINTS /usr/include /usr/include/nvidia-ml /usr/local/cuda/include
+                        /usr/local/cuda-13.0/targets/x86_64-linux/include
+                  PATH_SUFFIXES nvidia-ml)
+    endif()
+    if(NOT NVML_INCLUDE_DIR)
+        message(FATAL_ERROR "HAVE_CUDA=ON but NVML include dir not found. "
+                            "Set -DNVML_INCLUDE_DIR=/path/to where nvml.h exists, "
+                            "or set -DHAVE_CUDA=0 to disable GPU metrics.")
+    endif()
+    target_include_directories(unified_monitor PRIVATE ${NVML_INCLUDE_DIR})
+
     if(NOT NVML_LIB)
-        find_library(NVML_LIB nvidia-ml)
+        find_library(NVML_LIB nvidia-ml
+                     HINTS /usr/lib /usr/lib/x86_64-linux-gnu
+                           /usr/local/cuda/lib64
+                           /usr/local/cuda-13.0/targets/x86_64-linux/lib
+                           /usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs)
     endif()
     if(NOT NVML_LIB)
-        message(FATAL_ERROR "HAVE_CUDA is ON but NVML library not found. "
-                            "Pass -DNVML_LIB=/path/to/libnvidia-ml.so or set -DHAVE_CUDA=0 to disable.")
+        message(FATAL_ERROR "HAVE_CUDA=ON but NVML library not found. "
+                            "Set -DNVML_LIB=/path/to/libnvidia-ml.so, "
+                            "or set -DHAVE_CUDA=0 to disable GPU metrics.")
     endif()
     target_link_libraries(unified_monitor PRIVATE ${NVML_LIB})
     target_compile_definitions(unified_monitor PRIVATE HAVE_CUDA=1)
@@ -69,6 +86,6 @@ else()
     target_compile_definitions(unified_monitor PRIVATE HAVE_CUDA=0)
 endif()
 
-# Build notes:
-#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# Build:
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 #   cmake --build build -j

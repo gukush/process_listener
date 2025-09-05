@@ -1,157 +1,132 @@
 // aggregation_export.cpp
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
+#include <fstream>
+#include <numeric>
+#include <string>
+#include <vector>
 
-class MetricsAggregator {
-public:
-    struct ChunkAggregates {
-        std::string chunk_id;
-        std::string task_id;
-        double duration_ms;
-        
-        // OS metrics
-        double avg_cpu_percent;
-        double peak_cpu_percent;
-        double total_cpu_time_ms;  // CPU time consumed
-        double avg_memory_mb;
-        double peak_memory_mb;
-        double total_disk_read_mb;
-        double total_disk_write_mb;
-        double total_network_rx_mb;
-        double total_network_tx_mb;
-        
-        // GPU metrics  
-        double avg_gpu_util_percent;
-        double peak_gpu_util_percent;
-        double avg_gpu_memory_mb;
-        double peak_gpu_memory_mb;
-        double avg_power_watts;
-        double peak_power_watts;
-        double total_energy_joules;
-        double avg_sm_clock_mhz;
-        
-        size_t sample_count;
-    };
-    
-    struct TaskAggregates {
-        std::string task_id;
-        size_t chunk_count;
-        double total_duration_ms;
-        double total_compute_time_ms;  // Sum of all chunk durations
-        
-        // Aggregated from all chunks
-        double total_cpu_time_ms;
-        double peak_cpu_percent;
-        double avg_memory_mb;
-        double peak_memory_mb;
-        double total_disk_io_mb;
-        double total_network_io_mb;
-        
-        double total_energy_joules;
-        double avg_gpu_util_percent;
-        double peak_gpu_util_percent;
-        
-        // Efficiency metrics
-        double parallelism_factor;  // total_compute_time / total_duration
-        double gpu_efficiency;       // avg GPU util during execution
-    };
-    
-    // Generate aggregates
-    ChunkAggregates aggregateChunk(const ChunkMetrics& chunk);
-    TaskAggregates aggregateTask(const std::string& task_id,
-                                 const std::vector<ChunkMetrics>& chunks);
-    
-    // Export functions
-    void exportChunkCSV(const std::string& filename,
-                       const std::vector<ChunkAggregates>& chunks);
-    void exportTaskCSV(const std::string& filename,
-                      const std::vector<TaskAggregates>& tasks);
-    void exportTimeSeriesCSV(const std::string& filename,
-                           const ChunkMetrics& chunk);
-};
+#include "orchestrator.cpp" // pragma once; brings in ChunkMetrics, MetricsAggregator, structs
 
-TaskAggregates MetricsAggregator::aggregateTask(const std::string& task_id,
-                                               const std::vector<ChunkMetrics>& chunks) {
-    TaskAggregates task;
-    task.task_id = task_id;
-    task.chunk_count = chunks.size();
-    
-    if (chunks.empty()) return task;
-    
-    // Find overall task timeline
-    auto task_start = chunks[0].arrival_time;
-    auto task_end = chunks[0].completion_time;
-    
-    for (const auto& chunk : chunks) {
-        task_start = std::min(task_start, chunk.arrival_time);
-        task_end = std::max(task_end, chunk.completion_time);
-        
-        // Aggregate chunk metrics
-        ChunkAggregates ca = aggregateChunk(chunk);
-        
-        task.total_compute_time_ms += ca.duration_ms;
-        task.total_cpu_time_ms += ca.total_cpu_time_ms;
-        task.peak_cpu_percent = std::max(task.peak_cpu_percent, ca.peak_cpu_percent);
-        task.peak_memory_mb = std::max(task.peak_memory_mb, ca.peak_memory_mb);
-        task.total_disk_io_mb += (ca.total_disk_read_mb + ca.total_disk_write_mb);
-        task.total_network_io_mb += (ca.total_network_rx_mb + ca.total_network_tx_mb);
-        task.total_energy_joules += ca.total_energy_joules;
-        task.peak_gpu_util_percent = std::max(task.peak_gpu_util_percent, 
-                                              ca.peak_gpu_util_percent);
+using namespace std::chrono;
+
+namespace unified_monitor {
+
+static inline double tp_secs(const Clock::time_point& tp) {
+    return duration<double>(tp.time_since_epoch()).count();
+}
+
+MetricsAggregator::ChunkAggregates
+MetricsAggregator::aggregateChunk(const ChunkMetrics& chunk) {
+    ChunkAggregates out{};
+    out.chunk_id = chunk.chunk_id;
+    out.task_id  = chunk.task_id;
+
+    double t0 = tp_secs(chunk.arrival_time);
+    double t1 = tp_secs(chunk.completion_time);
+    if (t1 <= 0.0) t1 = tp_secs(Clock::now());
+    out.duration_ms = (t1 - t0) * 1000.0;
+
+    // OS
+    out.peak_cpu_percent = 0.0;
+    out.peak_mem_mb = 0.0;
+    for (const auto& os : chunk.os_samples) {
+        out.peak_cpu_percent = std::max(out.peak_cpu_percent, os.cpu_percent);
+        out.peak_mem_mb = std::max(out.peak_mem_mb, os.mem_rss_kb / 1024.0);
     }
-    
-    task.total_duration_ms = std::chrono::duration<double, std::milli>(
-        task_end - task_start).count();
-    
-    // Calculate efficiency metrics
-    task.parallelism_factor = task.total_compute_time_ms / task.total_duration_ms;
-    
-    // Average memory across all chunks
-    task.avg_memory_mb = 0;
-    for (const auto& chunk : chunks) {
-        ChunkAggregates ca = aggregateChunk(chunk);
-        task.avg_memory_mb += ca.avg_memory_mb;
+
+    // GPU
+    out.peak_gpu_util_percent = 0.0;
+    double sum_power = 0.0;
+    for (const auto& g : chunk.gpu_samples) {
+        out.peak_gpu_util_percent = std::max(out.peak_gpu_util_percent, static_cast<double>(g.gpu_util_percent));
+        sum_power += static_cast<double>(g.power_mw);
     }
-    task.avg_memory_mb /= chunks.size();
-    
-    // GPU efficiency: weighted average by chunk duration
-    double total_gpu_time = 0;
-    for (const auto& chunk : chunks) {
-        ChunkAggregates ca = aggregateChunk(chunk);
-        task.avg_gpu_util_percent += ca.avg_gpu_util_percent * ca.duration_ms;
-        total_gpu_time += ca.duration_ms;
+    out.avg_power_mw = chunk.gpu_samples.empty() ? 0.0 : (sum_power / chunk.gpu_samples.size());
+    out.sample_count = chunk.os_samples.size() + chunk.gpu_samples.size();
+    return out;
+}
+
+MetricsAggregator::TaskAggregates
+MetricsAggregator::aggregateTask(const std::string& task_id,
+                                 const std::vector<ChunkMetrics>& chunks) {
+    TaskAggregates out{};
+    out.task_id = task_id;
+    out.chunk_count = 0;
+    out.total_duration_ms = 0.0;
+    out.total_compute_time_ms = 0.0;
+    out.peak_cpu_percent = 0.0;
+    out.peak_gpu_util_percent = 0.0;
+    out.avg_power_mw = 0.0;
+
+    double sum_power = 0.0;
+    size_t power_samples = 0;
+
+    for (const auto& ch : chunks) {
+        if (ch.task_id != task_id) continue;
+        out.chunk_count++;
+
+        double t0 = tp_secs(ch.arrival_time);
+        double t1 = tp_secs(ch.completion_time);
+        if (t1 <= 0.0) t1 = tp_secs(Clock::now());
+        double dur_ms = (t1 - t0) * 1000.0;
+        out.total_duration_ms += dur_ms;
+
+        // naive "compute time" approximation: time between start and completion
+        double ts = tp_secs(ch.start_time);
+        out.total_compute_time_ms += std::max(0.0, (t1 - ts) * 1000.0);
+
+        for (const auto& os : ch.os_samples) {
+            out.peak_cpu_percent = std::max(out.peak_cpu_percent, os.cpu_percent);
+        }
+        for (const auto& g : ch.gpu_samples) {
+            out.peak_gpu_util_percent = std::max(out.peak_gpu_util_percent, static_cast<double>(g.gpu_util_percent));
+            sum_power += static_cast<double>(g.power_mw);
+            power_samples++;
+        }
     }
-    if (total_gpu_time > 0) {
-        task.avg_gpu_util_percent /= total_gpu_time;
-        task.gpu_efficiency = task.avg_gpu_util_percent;
+    out.avg_power_mw = power_samples ? (sum_power / power_samples) : 0.0;
+    return out;
+}
+
+void MetricsAggregator::exportChunkCSV(const std::string& filename,
+                                       const std::vector<ChunkAggregates>& chunks) {
+    std::ofstream file(filename);
+    file << "chunk_id,task_id,duration_ms,peak_cpu_percent,peak_mem_mb,peak_gpu_util_percent,avg_power_mw,sample_count\n";
+    for (const auto& c : chunks) {
+        file << c.chunk_id << "," << c.task_id << ","
+             << c.duration_ms << "," << c.peak_cpu_percent << ","
+             << c.peak_mem_mb << "," << c.peak_gpu_util_percent << ","
+             << c.avg_power_mw << "," << c.sample_count << "\n";
     }
-    
-    return task;
 }
 
 void MetricsAggregator::exportTaskCSV(const std::string& filename,
-                                     const std::vector<TaskAggregates>& tasks) {
+                                      const std::vector<TaskAggregates>& tasks) {
     std::ofstream file(filename);
-    
-    file << "task_id,chunk_count,total_duration_ms,total_compute_time_ms,"
-         << "parallelism_factor,total_cpu_time_ms,peak_cpu_percent,"
-         << "avg_memory_mb,peak_memory_mb,total_disk_io_mb,"
-         << "total_network_io_mb,total_energy_joules,avg_gpu_util_percent,"
-         << "peak_gpu_util_percent,gpu_efficiency\n";
-    
-    for (const auto& task : tasks) {
-        file << task.task_id << ","
-             << task.chunk_count << ","
-             << task.total_duration_ms << ","
-             << task.total_compute_time_ms << ","
-             << task.parallelism_factor << ","
-             << task.total_cpu_time_ms << ","
-             << task.peak_cpu_percent << ","
-             << task.avg_memory_mb << ","
-             << task.peak_memory_mb << ","
-             << task.total_disk_io_mb << ","
-             << task.total_network_io_mb << ","
-             << task.total_energy_joules << ","
-             << task.avg_gpu_util_percent << ","
-             << task.peak_gpu_util_percent << ","
-             << task.gpu_efficiency << "\n";
+    file << "task_id,chunk_count,total_duration_ms,total_compute_time_ms,peak_cpu_percent,peak_gpu_util_percent,avg_power_mw\n";
+    for (const auto& t : tasks) {
+        file << t.task_id << "," << t.chunk_count << ","
+             << t.total_duration_ms << "," << t.total_compute_time_ms << ","
+             << t.peak_cpu_percent << "," << t.peak_gpu_util_percent << ","
+             << t.avg_power_mw << "\n";
     }
 }
+
+// Optional: dump regular time series for a single chunk (for debugging/plotting)
+void MetricsAggregator::exportTimeSeriesCSV(const std::string& filename,
+                                            const ChunkMetrics& chunk) {
+    std::ofstream f(filename);
+    f << "ts,kind,pid,value\n";
+    for (const auto& os : chunk.os_samples) {
+        f << os.timestamp << ",cpu," << os.pid << "," << os.cpu_percent << "\n";
+        f << os.timestamp << ",rss_kb," << os.pid << "," << os.mem_rss_kb << "\n";
+    }
+    for (const auto& g : chunk.gpu_samples) {
+        f << g.timestamp << ",gpu_util," << -1 << "," << static_cast<int>(g.gpu_util_percent) << "\n";
+        f << g.timestamp << ",power_mw," << -1 << "," << g.power_mw << "\n";
+    }
+}
+
+} // namespace unified_monitor

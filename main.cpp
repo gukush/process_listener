@@ -1,11 +1,4 @@
-// main.cpp - Unified orchestrator entry with HAVE_CUDA
-
-//   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DHAVE_CUDA=1
-//   cmake --build build -j
-//
-//   ./build/unified_monitor --mode browser+cpp --server ws://127.0.0.1:8765 \
-//       --browser-path /usr/bin/google-chrome --browser-url http://localhost:3000 \
-//       --cpp-client ./cpp_client --gpu-index 0 --out-dir ./metrics
+// main.cpp - Unified orchestrator entry with optional CUDA/NVML via HAVE_CUDA
 
 #include <atomic>
 #include <chrono>
@@ -26,7 +19,11 @@
 #include <nlohmann/json.hpp>
 
 #if HAVE_CUDA
-  #include <nvml.h>
+  #if __has_include(<nvml.h>)
+    #include <nvml.h>
+  #else
+    #include <nvidia-ml/nvml.h>
+  #endif
 #endif
 
 #include "orchestrator.cpp"
@@ -39,9 +36,7 @@ namespace unified_monitor {
 static std::atomic<bool> g_interrupted = false;
 static void handle_signal(int) { g_interrupted = true; }
 
-struct ChildProcess {
-    pid_t pid = -1;
-};
+struct ChildProcess { pid_t pid = -1; };
 
 static ChildProcess spawn_process(const std::vector<std::string>& argv) {
     std::vector<char*> cargv;
@@ -50,29 +45,19 @@ static ChildProcess spawn_process(const std::vector<std::string>& argv) {
     cargv.push_back(nullptr);
 
     pid_t pid = fork();
-    if (pid == -1) {
-        perror("fork");
-        return {};
-    }
-    if (pid == 0) {
-        execvp(cargv[0], cargv.data());
-        perror("execvp");
-        _exit(127);
-    }
+    if (pid == -1) { perror("fork"); return {}; }
+    if (pid == 0) { execvp(cargv[0], cargv.data()); perror("execvp"); _exit(127); }
     return {pid};
 }
 
-class EnhancedMessageInterceptor {
+// ---- Interceptor implementation (subclass of interface from websocket_proxy.hpp)
+class ProxyMessageInterceptor : public EnhancedMessageInterceptor {
 public:
-    explicit EnhancedMessageInterceptor(ChunkTracker* tracker)
-        : tracker_(tracker) {}
-
-    void onTaskInit(const json& msg) {
-        (void)msg;
-        // idk if it should be continued
+    explicit ProxyMessageInterceptor(ChunkTracker* tracker) : tracker_(tracker) {}
+    void onTaskInit(const json& msg) override {
+        (void)msg; /* no-op for now */
     }
-
-    void onChunkAssign(const json& msg) {
+    void onChunkAssign(const json& msg) override {
         try {
             std::string chunkId = msg.at("chunkId").get<std::string>();
             std::string taskId  = msg.value("taskId", std::string{});
@@ -82,8 +67,7 @@ public:
             std::cerr << "[Interceptor] onChunkAssign parse error: " << e.what() << "\n";
         }
     }
-
-    void onChunkResult(const json& msg) {
+    void onChunkResult(const json& msg) override {
         try {
             std::string chunkId = msg.at("chunkId").get<std::string>();
             std::string status  = msg.value("status", "completed");
@@ -92,11 +76,11 @@ public:
             std::cerr << "[Interceptor] onChunkResult parse error: " << e.what() << "\n";
         }
     }
-
 private:
     ChunkTracker* tracker_;
 };
 
+// --------- OSMetricsCollector thread orchestration ----------
 OSMetricsCollector::OSMetricsCollector() = default;
 OSMetricsCollector::~OSMetricsCollector() { stopMonitoring(); }
 
@@ -115,9 +99,7 @@ void OSMetricsCollector::startMonitoring(const std::vector<pid_t>& pids, unsigne
                 try {
                     auto m = collectForPid(pid);
                     batch.push_back(m);
-                } catch (...) {
-                    // ignore missing/zombie PIDs
-                }
+                } catch (...) {}
             }
             if (!batch.empty()) {
                 std::lock_guard<std::mutex> lock(metrics_mutex_);
@@ -139,38 +121,28 @@ std::vector<OSMetrics> OSMetricsCollector::getMetrics() const {
     return metrics_;
 }
 
-// GPUMetricsCollector
+// ------------------------ GPUMetricsCollector impl ---------------------------
 #if HAVE_CUDA
-
 static std::string nvml_err_str(nvmlReturn_t st) {
     const char* s = nvmlErrorString(st);
     return s ? std::string(s) : "NVML_ERROR";
 }
+#endif
 
-GPUMetricsCollector::GPUMetricsCollector(unsigned gpu_index)
-    : gpu_index_(gpu_index) {}
-
+GPUMetricsCollector::GPUMetricsCollector(unsigned gpu_index) : gpu_index_(gpu_index) {}
 GPUMetricsCollector::~GPUMetricsCollector() { stopMonitoring(); }
 
 void GPUMetricsCollector::startMonitoring(unsigned interval_ms) {
+#if HAVE_CUDA
     stopMonitoring();
     interval_ms_ = interval_ms ? interval_ms : 50;
     running_ = true;
     worker_ = std::thread([this]() {
         nvmlReturn_t st = nvmlInit_v2();
-        if (st != NVML_SUCCESS) {
-            std::cerr << "[NVML] init failed: " << nvml_err_str(st) << "\n";
-            running_ = false;
-            return;
-        }
+        if (st != NVML_SUCCESS) { std::cerr << "[NVML] init failed: " << nvml_err_str(st) << "\n"; running_ = false; return; }
         nvmlDevice_t dev{};
         st = nvmlDeviceGetHandleByIndex_v2(gpu_index_, &dev);
-        if (st != NVML_SUCCESS) {
-            std::cerr << "[NVML] device index " << gpu_index_ << " error: " << nvml_err_str(st) << "\n";
-            nvmlShutdown();
-            running_ = false;
-            return;
-        }
+        if (st != NVML_SUCCESS) { std::cerr << "[NVML] device " << gpu_index_ << " error: " << nvml_err_str(st) << "\n"; nvmlShutdown(); running_ = false; return; }
 
         while (running_) {
             auto t = Clock::now();
@@ -178,30 +150,21 @@ void GPUMetricsCollector::startMonitoring(unsigned interval_ms) {
             m.timestamp = std::chrono::duration<double>(t.time_since_epoch()).count();
             m.gpu_index = gpu_index_;
 
-            // Power (mW)
             unsigned int power = 0;
             if (nvmlDeviceGetPowerUsage(dev, &power) == NVML_SUCCESS) m.power_mw = power;
 
-            // Utilization %
             nvmlUtilization_t util{};
             if (nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
                 m.gpu_util_percent = util.gpu;
                 m.mem_util_percent = util.memory;
             }
 
-            // Memory used
             nvmlMemory_t mem{};
-            if (nvmlDeviceGetMemoryInfo(dev, &mem) == NVML_SUCCESS) {
-                m.mem_used_bytes = mem.used;
-            }
+            if (nvmlDeviceGetMemoryInfo(dev, &mem) == NVML_SUCCESS) m.mem_used_bytes = mem.used;
 
-            // SM clock
             unsigned int sm = 0;
-            if (nvmlDeviceGetClockInfo(dev, NVML_CLOCK_SM, &sm) == NVML_SUCCESS) {
-                m.sm_clock_mhz = sm;
-            }
+            if (nvmlDeviceGetClockInfo(dev, NVML_CLOCK_SM, &sm) == NVML_SUCCESS) m.sm_clock_mhz = sm;
 
-            // Per-process GPU utilization (newer API)
             const unsigned int MAX_SAMPLES = 1024;
             std::vector<nvmlProcessUtilizationSample_t> samples(MAX_SAMPLES);
             unsigned int n = MAX_SAMPLES;
@@ -211,28 +174,19 @@ void GPUMetricsCollector::startMonitoring(unsigned interval_ms) {
                     const auto& s = samples[i];
                     m.pid_gpu_percent[static_cast<unsigned int>(s.pid)] = s.smUtil;
                 }
-            } else {
-                // Fallback for older drivers (no % available)
-                unsigned int count = 128;
-                std::vector<nvmlProcessInfo_t> procs(count);
-                st = nvmlDeviceGetComputeRunningProcesses(dev, &count, procs.data());
-                if (st == NVML_SUCCESS) {
-                    for (unsigned int i = 0; i < count; ++i) {
-                        m.pid_gpu_percent[static_cast<unsigned int>(procs[i].pid)] = 0;
-                    }
-                }
             }
 
-            {
-                std::lock_guard<std::mutex> lk(mx_);
-                samples_.push_back(std::move(m));
-            }
+            { std::lock_guard<std::mutex> lk(mx_); samples_.push_back(std::move(m)); }
 
             std::this_thread::sleep_until(t + std::chrono::milliseconds(interval_ms_));
         }
 
         nvmlShutdown();
     });
+#else
+    (void)interval_ms;
+    running_ = false; // disabled
+#endif
 }
 
 void GPUMetricsCollector::stopMonitoring() {
@@ -246,37 +200,14 @@ std::vector<GPUMetrics> GPUMetricsCollector::getMetrics() const {
     return samples_;
 }
 
-#else
-
-GPUMetricsCollector::GPUMetricsCollector(unsigned gpu_index)
-    : gpu_index_(gpu_index) {}
-
-GPUMetricsCollector::~GPUMetricsCollector() { stopMonitoring(); }
-
-void GPUMetricsCollector::startMonitoring(unsigned /*interval_ms*/) {
-    running_ = false;
-}
-
-void GPUMetricsCollector::stopMonitoring() {
-    running_ = false;
-    if (worker_.joinable()) worker_.join();
-}
-
-std::vector<GPUMetrics> GPUMetricsCollector::getMetrics() const {
-    return {}; // no GPU samples
-}
-
-#endif // HAVE_CUDA
-
+// ------------------------------ UnifiedOrchestrator --------------------------
 UnifiedOrchestrator::UnifiedOrchestrator()
     : os_collector_(std::make_unique<OSMetricsCollector>()),
       gpu_collector_(std::make_unique<GPUMetricsCollector>(0)),
       chunk_tracker_(std::make_unique<ChunkTracker>()),
       interceptor_(nullptr) {}
 
-UnifiedOrchestrator::~UnifiedOrchestrator() {
-    stop();
-}
+UnifiedOrchestrator::~UnifiedOrchestrator() { stop(); }
 
 void UnifiedOrchestrator::setupMessageProxy(const std::string& upstreamUrl) {
     std::string host = "127.0.0.1";
@@ -301,53 +232,30 @@ void UnifiedOrchestrator::setupMessageProxy(const std::string& upstreamUrl) {
 
     static std::unique_ptr<BeastWebSocketProxy> s_proxy;
     if (!s_proxy) s_proxy.reset(new BeastWebSocketProxy(chunk_tracker_.get(),
-                                                        new EnhancedMessageInterceptor(chunk_tracker_.get())));
+                                                        new ProxyMessageInterceptor(chunk_tracker_.get())));
     bool ok = s_proxy->start(listen_port, host, port);
-    if (!ok) {
-        std::cerr << "[Orchestrator] Failed to start WebSocket proxy on :" << listen_port
-                  << " to " << host << ":" << port << "\n";
-    } else {
-        std::cout << "[Orchestrator] WebSocket proxy listening on :" << listen_port
-                  << " upstream " << host << ":" << port << "\n";
-    }
+    if (!ok) std::cerr << "[Orchestrator] WS proxy start failed on :" << listen_port << "\n";
+    else std::cout << "[Orchestrator] WS proxy on :" << listen_port << " -> " << host << ":" << port << "\n";
 }
 
 bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
     running_ = true;
-
     setupMessageProxy(cfg.server_path);
 
-    std::vector<std::string> browser_argv = {
-        cfg.browser_path,
-        "--new-window",
-        cfg.browser_url
-    };
-    auto browser = spawn_process(browser_argv);
-    if (browser.pid <= 0) {
-        std::cerr << "[Spawn] Failed to start browser at " << cfg.browser_path << "\n";
-    } else {
-        std::cout << "[Spawn] Browser pid=" << browser.pid << "\n";
-    }
+    auto browser = spawn_process({ cfg.browser_path, "--new-window", cfg.browser_url });
+    if (browser.pid > 0) std::cout << "[Spawn] Browser pid=" << browser.pid << "\n";
+    else std::cerr << "[Spawn] Browser failed\n";
 
-    std::vector<std::string> cpp_argv = { cfg.cpp_client_path };
-    auto cpp = spawn_process(cpp_argv);
-    if (cpp.pid <= 0) {
-        std::cerr << "[Spawn] Failed to start C++ client at " << cfg.cpp_client_path << "\n";
-    } else {
-        std::cout << "[Spawn] C++ client pid=" << cpp.pid << "\n";
-    }
+    auto cpp = spawn_process({ cfg.cpp_client_path });
+    if (cpp.pid > 0) std::cout << "[Spawn] C++ client pid=" << cpp.pid << "\n";
+    else std::cerr << "[Spawn] C++ client failed\n";
 
     gpu_collector_.reset(new GPUMetricsCollector(cfg.gpu_index));
 
-    {
-        std::vector<pid_t> pids;
-        if (browser.pid > 0) pids.push_back(browser.pid);
-        if (cpp.pid > 0)     pids.push_back(cpp.pid);
-        os_collector_->startMonitoring(pids, cfg.os_monitor_interval_ms);
-    }
+    std::vector<pid_t> pids; if (browser.pid > 0) pids.push_back(browser.pid); if (cpp.pid > 0) pids.push_back(cpp.pid);
+    os_collector_->startMonitoring(pids, cfg.os_monitor_interval_ms);
 
 #if HAVE_CUDA
-    gpu_collector_->stopMonitoring();
     gpu_collector_->startMonitoring(cfg.gpu_monitor_interval_ms);
 #else
     std::cout << "[GPU] HAVE_CUDA=0 -> GPU/NVML metrics disabled.\n";
@@ -356,36 +264,31 @@ bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
     auto t0 = Clock::now();
     while (running_) {
         if (g_interrupted) break;
-        if (cfg.duration_sec > 0 &&
-            Clock::now() - t0 > std::chrono::seconds(cfg.duration_sec)) break;
+        if (cfg.duration_sec > 0 && Clock::now() - t0 > std::chrono::seconds(cfg.duration_sec)) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+
     os_collector_->stopMonitoring();
 #if HAVE_CUDA
     gpu_collector_->stopMonitoring();
 #endif
 
     exportMetrics(cfg);
-    if (browser.pid > 0) kill(browser.pid, SIGTERM);
-    if (cpp.pid > 0)     kill(cpp.pid, SIGTERM);
 
+    if (browser.pid > 0) kill(browser.pid, SIGTERM);
+    if (cpp.pid > 0) kill(cpp.pid, SIGTERM);
     return true;
 }
 
 bool UnifiedOrchestrator::runCppOnly(const Config& cfg) {
     running_ = true;
 
-    // Spawn native client (direct-to-server path could be added here)
-    std::vector<std::string> cpp_argv = { cfg.cpp_client_path };
-    auto cpp = spawn_process(cpp_argv);
-    if (cpp.pid <= 0) {
-        std::cerr << "[Spawn] Failed to start C++ client at " << cfg.cpp_client_path << "\n";
-    } else {
-        std::cout << "[Spawn] C++ client pid=" << cpp.pid << "\n";
-    }
+    auto cpp = spawn_process({ cfg.cpp_client_path });
+    if (cpp.pid > 0) std::cout << "[Spawn] C++ client pid=" << cpp.pid << "\n";
+    else std::cerr << "[Spawn] C++ client failed\n";
 
-    // Recreate GPU collector for requested index
     gpu_collector_.reset(new GPUMetricsCollector(cfg.gpu_index));
+
     os_collector_->startMonitoring(std::vector<pid_t>{ cpp.pid }, cfg.os_monitor_interval_ms);
 #if HAVE_CUDA
     gpu_collector_->startMonitoring(cfg.gpu_monitor_interval_ms);
@@ -396,8 +299,7 @@ bool UnifiedOrchestrator::runCppOnly(const Config& cfg) {
     auto t0 = Clock::now();
     while (running_) {
         if (g_interrupted) break;
-        if (cfg.duration_sec > 0 &&
-            Clock::now() - t0 > std::chrono::seconds(cfg.duration_sec)) break;
+        if (cfg.duration_sec > 0 && Clock::now() - t0 > std::chrono::seconds(cfg.duration_sec)) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
@@ -412,24 +314,20 @@ bool UnifiedOrchestrator::runCppOnly(const Config& cfg) {
     return true;
 }
 
-void UnifiedOrchestrator::stop() {
-    running_ = false;
-}
+void UnifiedOrchestrator::stop() { running_ = false; }
 
-static inline double tp_to_secs(const Clock::time_point& tp) {
+static inline double tp_secs(const Clock::time_point& tp) {
     return std::chrono::duration<double>(tp.time_since_epoch()).count();
 }
 
-static std::vector<OSMetrics> filter_os(const std::vector<OSMetrics>& in,
-                                        double t0, double t1) {
-    std::vector<OSMetrics> out;
+static std::vector<OSMetrics> filter_os(const std::vector<OSMetrics>& in, double t0, double t1) {
+    std::vector<OSMetrics> out; out.reserve(in.size());
     for (const auto& m : in) if (m.timestamp >= t0 && m.timestamp <= t1) out.push_back(m);
     return out;
 }
 #if HAVE_CUDA
-static std::vector<GPUMetrics> filter_gpu(const std::vector<GPUMetrics>& in,
-                                          double t0, double t1) {
-    std::vector<GPUMetrics> out;
+static std::vector<GPUMetrics> filter_gpu(const std::vector<GPUMetrics>& in, double t0, double t1) {
+    std::vector<GPUMetrics> out; out.reserve(in.size());
     for (const auto& m : in) if (m.timestamp >= t0 && m.timestamp <= t1) out.push_back(m);
     return out;
 }
@@ -438,30 +336,26 @@ static std::vector<GPUMetrics> filter_gpu(const std::vector<GPUMetrics>& in,
 void UnifiedOrchestrator::exportMetrics(const Config& cfg) {
     std::filesystem::create_directories(cfg.output_dir);
     const auto os_all  = os_collector_->getMetrics();
-
 #if HAVE_CUDA
     const auto gpu_all = gpu_collector_->getMetrics();
 #endif
 
     auto chunks = chunk_tracker_->getAllChunks();
     for (auto& ch : chunks) {
-        const double t_begin = tp_to_secs(ch.arrival_time);
-        double t_end = tp_to_secs(ch.completion_time);
-        if (t_end <= 0.0) t_end = tp_to_secs(Clock::now());
+        const double t_begin = tp_secs(ch.arrival_time);
+        double t_end = tp_secs(ch.completion_time);
+        if (t_end <= 0.0) t_end = tp_secs(Clock::now());
 
-        auto os_win = filter_os(os_all, t_begin, t_end);
-        chunk_tracker_->attachOSMetrics(ch.chunk_id, os_win);
-
+        chunk_tracker_->attachOSMetrics(ch.chunk_id, filter_os(os_all, t_begin, t_end));
 #if HAVE_CUDA
-        auto gpu_win = filter_gpu(gpu_all, t_begin, t_end);
-        chunk_tracker_->attachGPUMetrics(ch.chunk_id, gpu_win);
+        chunk_tracker_->attachGPUMetrics(ch.chunk_id, filter_gpu(gpu_all, t_begin, t_end));
 #endif
     }
 
     chunk_tracker_->exportToCSV(cfg.output_dir + "/chunks.csv");
 
     if (cfg.export_detailed_samples) {
-        {
+        {   // OS raw
             std::ofstream f(cfg.output_dir + "/os_samples.csv");
             f << "timestamp,pid,cpu_percent,mem_rss_kb,mem_vms_kb,disk_read_bytes,disk_write_bytes,net_recv_bytes,net_sent_bytes\n";
             for (auto& m : os_all) {
@@ -471,9 +365,8 @@ void UnifiedOrchestrator::exportMetrics(const Config& cfg) {
                   << m.net_recv_bytes << "," << m.net_sent_bytes << "\n";
             }
         }
-
 #if HAVE_CUDA
-        {
+        {   // GPU raw
             std::ofstream f(cfg.output_dir + "/gpu_samples.csv");
             f << "timestamp,gpu_index,power_mw,gpu_util_percent,mem_util_percent,mem_used_bytes,sm_clock_mhz\n";
             for (auto& m : gpu_all) {
@@ -486,7 +379,7 @@ void UnifiedOrchestrator::exportMetrics(const Config& cfg) {
     }
 }
 
-// CLI
+// ----------------------------------- CLI -------------------------------------
 static void print_usage(const char* argv0) {
     std::cerr <<
     "Usage:\n"
@@ -527,19 +420,13 @@ int main(int argc, char** argv) {
         else if (a == "--duration") cfg.duration_sec = std::stoi(need("--duration"));
         else if (a == "--out-dir") cfg.output_dir = need("--out-dir");
         else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
-        else {
-            std::cerr << "Unknown arg: " << a << "\n";
-            print_usage(argv[0]);
-            return 2;
-        }
+        else { std::cerr << "Unknown arg: " << a << "\n"; print_usage(argv[0]); return 2; }
     }
 
     UnifiedOrchestrator orch;
-
-    bool ok = false;
-    if (mode == "browser+cpp") ok = orch.runBrowserPlusCpp(cfg);
-    else if (mode == "cpp-only") ok = orch.runCppOnly(cfg);
-    else { std::cerr << "Invalid --mode\n"; return 2; }
+    bool ok = (mode == "browser+cpp") ? orch.runBrowserPlusCpp(cfg)
+             : (mode == "cpp-only")   ? orch.runCppOnly(cfg)
+             : (std::cerr << "Invalid --mode\n", false);
 
     orch.stop();
     return ok ? 0 : 1;
