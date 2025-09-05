@@ -109,6 +109,7 @@ public:
     void exportToCSV(const std::string& filename) const;
 
 private:
+    friend class MetricsAggregator;
     mutable std::mutex mx_;
     std::map<std::string, ChunkMetrics> chunks_;
 };
@@ -189,6 +190,16 @@ public:
                              const ChunkMetrics& chunk);
 };
 
+// --------- Process command specs for config-driven launch ---------
+struct CommandSpec {
+    bool enabled = true;                          // if false, skip launching
+    bool shell = false;                           // true => run via /bin/sh -lc "cmd"
+    std::vector<std::string> argv;                // argv form (takes precedence over cmd)
+    std::string cmd;                              // full shell command (if shell=true or argv empty)
+    std::string cwd;                              // working directory (optional)
+    std::map<std::string, std::string> env;       // extra environment (optional)
+};
+
 // --------- Orchestrator ---------
 class EnhancedMessageInterceptor; // interface (defined in websocket_proxy.hpp)
 class BeastWebSocketProxy;        // fwd
@@ -196,18 +207,27 @@ class BeastWebSocketProxy;        // fwd
 class UnifiedOrchestrator {
 public:
     struct Config {
+        // Connection
         std::string server_path = "ws://127.0.0.1:8765";
+
+        // Legacy (kept for convenience; overridden by CommandSpec if provided)
         std::string browser_path = "/usr/bin/google-chrome";
         std::string browser_url  = "http://localhost:3000";
         std::string cpp_client_path = "./cpp_client";
 
+        // New: exact commands via config
+        CommandSpec browser; // used in mode=browser+cpp
+        CommandSpec cpp;     // used in both modes
+
+        // Sampling
         unsigned gpu_index = 0;
         unsigned os_monitor_interval_ms  = 100;
         unsigned gpu_monitor_interval_ms = 50;
 
-        int duration_sec = 0; // 0 = run until signal
+        // Run control
+        int         duration_sec = 0; // 0 = run until signal
         std::string output_dir = "./metrics";
-        bool export_detailed_samples = true;
+        bool        export_detailed_samples = true;
     };
 
     UnifiedOrchestrator();

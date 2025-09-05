@@ -1,4 +1,42 @@
-// main.cpp - Unified orchestrator entry with optional CUDA/NVML via HAVE_CUDA
+// main.cpp - Unified orchestrator with optional CUDA/NVML via HAVE_CUDA
+// Adds JSON config support to launch exact commands for browser / C++ client.
+//
+// Example config (config.json):
+// {
+//   "mode": "browser+cpp",                        // or "cpp-only"
+//   "server": "ws://127.0.0.1:8765",
+//
+//   "browser": {
+//     "enabled": true,
+//     "argv": ["/usr/bin/google-chrome", "--new-window", "http://localhost:3000"],
+//     "cwd": "/",
+//     "env": { "DISPLAY": ":0" },                 // e.g. required on X11
+//     "shell": false                              // if true, run via /bin/sh -lc "<joined argv>"
+//   },
+//
+//   "cpp_client": {
+//     "enabled": true,
+//     "argv": ["./cpp_client"],
+//     "cwd": "/home/user/project",
+//     "env": { },
+//     "shell": false
+//   },
+//
+//   "gpu_index": 0,
+//   "os_interval_ms": 100,
+//   "gpu_interval_ms": 50,
+//   "duration_sec": 0,                            // 0 = until signal
+//   "output_dir": "./metrics",
+//   "export_detailed_samples": true
+// }
+//
+// Run:
+//   ./unified_monitor --config ./config.json
+//
+// CLI still works without config:
+//   ./unified_monitor --mode browser+cpp --server ws://127.0.0.1:8765 \
+//       --browser-path /usr/bin/google-chrome --browser-url http://localhost:3000 \
+//       --cpp-client ./cpp_client --gpu-index 0 --out-dir ./metrics
 
 #include <atomic>
 #include <chrono>
@@ -15,6 +53,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <unistd.h>     // fork, execvp, chdir
+#include <stdlib.h>     // setenv
 
 #include <nlohmann/json.hpp>
 
@@ -33,29 +73,81 @@ using json = nlohmann::json;
 
 namespace unified_monitor {
 
+// ---------------- Global process-launch overrides from config -----------------
+struct SpawnSpec {
+    std::vector<std::string> argv;         // full argv (argv[0] is the executable)
+    std::string cwd;                       // optional working directory
+    std::map<std::string,std::string> env; // optional environment vars to set/override
+    bool shell = false;                    // if true, run via /bin/sh -lc "<joined argv>"
+    bool enabled = true;
+};
+
+static std::optional<SpawnSpec> g_browser_spec;
+static std::optional<SpawnSpec> g_cpp_spec;
+
+// --------------------------- signals -----------------------------------------
 static std::atomic<bool> g_interrupted = false;
 static void handle_signal(int) { g_interrupted = true; }
 
+// --------------------------- process spawn -----------------------------------
 struct ChildProcess { pid_t pid = -1; };
 
-static ChildProcess spawn_process(const std::vector<std::string>& argv) {
+static ChildProcess spawn_process(const SpawnSpec& spec) {
+    if (!spec.enabled) return {-1};
+
+    // Build cargv for execvp OR for /bin/sh -lc
+    std::vector<std::string> local_argv;
+    if (spec.shell) {
+        // Join argv as a single string command
+        std::string joined;
+        for (size_t i = 0; i < spec.argv.size(); ++i) {
+            if (i) joined += ' ';
+            joined += spec.argv[i];
+        }
+        local_argv = { "/bin/sh", "-lc", joined };
+    } else {
+        local_argv = spec.argv;
+        if (local_argv.empty()) {
+            std::cerr << "[Spawn] Empty argv; nothing to exec\n";
+            return {-1};
+        }
+    }
+
     std::vector<char*> cargv;
-    cargv.reserve(argv.size() + 1);
-    for (const auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
+    cargv.reserve(local_argv.size() + 1);
+    for (auto& s : local_argv) cargv.push_back(const_cast<char*>(s.c_str()));
     cargv.push_back(nullptr);
 
     pid_t pid = fork();
-    if (pid == -1) { perror("fork"); return {}; }
-    if (pid == 0) { execvp(cargv[0], cargv.data()); perror("execvp"); _exit(127); }
+    if (pid == -1) {
+        perror("fork");
+        return {-1};
+    }
+    if (pid == 0) {
+        // Child: set CWD and ENV if requested
+        if (!spec.cwd.empty()) {
+            if (chdir(spec.cwd.c_str()) != 0) {
+                perror("chdir");
+                _exit(127);
+            }
+        }
+        for (const auto& kv : spec.env) {
+            ::setenv(kv.first.c_str(), kv.second.c_str(), 1);
+        }
+        // Exec
+        execvp(cargv[0], cargv.data());
+        perror("execvp");
+        _exit(127);
+    }
     return {pid};
 }
 
-// ---- Interceptor implementation (subclass of interface from websocket_proxy.hpp)
+// ---------------------- Interceptor: proxy -> tracker ------------------------
 class ProxyMessageInterceptor : public EnhancedMessageInterceptor {
 public:
     explicit ProxyMessageInterceptor(ChunkTracker* tracker) : tracker_(tracker) {}
     void onTaskInit(const json& msg) override {
-        (void)msg; /* hook for future task-level data */
+        (void)msg; /* reserved for future task metadata */
     }
     void onChunkAssign(const json& msg) override {
         try {
@@ -209,11 +301,10 @@ UnifiedOrchestrator::UnifiedOrchestrator()
 
 UnifiedOrchestrator::~UnifiedOrchestrator() { stop(); }
 
-void UnifiedOrchestrator::setupMessageProxy(const std::string& upstreamUrl) {
-    std::string host = "127.0.0.1";
-    uint16_t port = 8765;
+static void parse_ws_url(const std::string& url, std::string& host, uint16_t& port) {
+    host = "127.0.0.1"; port = 8765;
     try {
-        std::string u = upstreamUrl;
+        std::string u = url;
         auto pos_ws = u.find("://");
         if (pos_ws != std::string::npos) u = u.substr(pos_ws + 3);
         auto colon = u.find(':');
@@ -227,7 +318,11 @@ void UnifiedOrchestrator::setupMessageProxy(const std::string& upstreamUrl) {
             host = (slash == std::string::npos) ? u : u.substr(0, slash);
         }
     } catch (...) {}
+}
 
+void UnifiedOrchestrator::setupMessageProxy(const std::string& upstreamUrl) {
+    std::string host; uint16_t port;
+    parse_ws_url(upstreamUrl, host, port);
     const uint16_t listen_port = 9797;
 
     static std::unique_ptr<BeastWebSocketProxy> s_proxy;
@@ -240,27 +335,48 @@ void UnifiedOrchestrator::setupMessageProxy(const std::string& upstreamUrl) {
 
 bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
     running_ = true;
+
+    // 1) Proxy
     setupMessageProxy(cfg.server_path);
 
-    auto browser = spawn_process({ cfg.browser_path, "--new-window", cfg.browser_url });
+    // 2) Spawn processes (use config overrides if provided)
+    ChildProcess browser{-1}, cpp{-1};
+    if (g_browser_spec && g_browser_spec->enabled) {
+        browser = spawn_process(*g_browser_spec);
+    } else {
+        // Fallback to previous behavior
+        SpawnSpec sp;
+        sp.argv = { cfg.browser_path, "--new-window", cfg.browser_url };
+        browser = spawn_process(sp);
+    }
     if (browser.pid > 0) std::cout << "[Spawn] Browser pid=" << browser.pid << "\n";
-    else std::cerr << "[Spawn] Browser failed\n";
+    else std::cerr << "[Spawn] Browser failed (pid=" << browser.pid << ")\n";
 
-    auto cpp = spawn_process({ cfg.cpp_client_path });
+    if (g_cpp_spec && g_cpp_spec->enabled) {
+        cpp = spawn_process(*g_cpp_spec);
+    } else {
+        SpawnSpec sp;
+        sp.argv = { cfg.cpp_client_path };
+        cpp = spawn_process(sp);
+    }
     if (cpp.pid > 0) std::cout << "[Spawn] C++ client pid=" << cpp.pid << "\n";
-    else std::cerr << "[Spawn] C++ client failed\n";
+    else std::cerr << "[Spawn] C++ client failed (pid=" << cpp.pid << ")\n";
 
+    // 3) Start collectors
     gpu_collector_.reset(new GPUMetricsCollector(cfg.gpu_index));
-
-    std::vector<pid_t> pids; if (browser.pid > 0) pids.push_back(browser.pid); if (cpp.pid > 0) pids.push_back(cpp.pid);
-    os_collector_->startMonitoring(pids, cfg.os_monitor_interval_ms);
-
+    {
+        std::vector<pid_t> pids;
+        if (browser.pid > 0) pids.push_back(browser.pid);
+        if (cpp.pid > 0)     pids.push_back(cpp.pid);
+        os_collector_->startMonitoring(pids, cfg.os_monitor_interval_ms);
+    }
 #if HAVE_CUDA
     gpu_collector_->startMonitoring(cfg.gpu_monitor_interval_ms);
 #else
     std::cout << "[GPU] HAVE_CUDA=0 -> GPU/NVML metrics disabled.\n";
 #endif
 
+    // 4) Wait loop
     auto t0 = Clock::now();
     while (running_) {
         if (g_interrupted) break;
@@ -268,27 +384,34 @@ bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
+    // 5) Stop collectors and export
     os_collector_->stopMonitoring();
 #if HAVE_CUDA
     gpu_collector_->stopMonitoring();
 #endif
-
     exportMetrics(cfg);
 
+    // 6) Best-effort terminate
     if (browser.pid > 0) kill(browser.pid, SIGTERM);
-    if (cpp.pid > 0) kill(cpp.pid, SIGTERM);
+    if (cpp.pid > 0)     kill(cpp.pid, SIGTERM);
     return true;
 }
 
 bool UnifiedOrchestrator::runCppOnly(const Config& cfg) {
     running_ = true;
 
-    auto cpp = spawn_process({ cfg.cpp_client_path });
+    ChildProcess cpp{-1};
+    if (g_cpp_spec && g_cpp_spec->enabled) {
+        cpp = spawn_process(*g_cpp_spec);
+    } else {
+        SpawnSpec sp;
+        sp.argv = { cfg.cpp_client_path };
+        cpp = spawn_process(sp);
+    }
     if (cpp.pid > 0) std::cout << "[Spawn] C++ client pid=" << cpp.pid << "\n";
-    else std::cerr << "[Spawn] C++ client failed\n";
+    else std::cerr << "[Spawn] C++ client failed (pid=" << cpp.pid << ")\n";
 
     gpu_collector_.reset(new GPUMetricsCollector(cfg.gpu_index));
-
     os_collector_->startMonitoring(std::vector<pid_t>{ cpp.pid }, cfg.os_monitor_interval_ms);
 #if HAVE_CUDA
     gpu_collector_->startMonitoring(cfg.gpu_monitor_interval_ms);
@@ -307,7 +430,6 @@ bool UnifiedOrchestrator::runCppOnly(const Config& cfg) {
 #if HAVE_CUDA
     gpu_collector_->stopMonitoring();
 #endif
-
     exportMetrics(cfg);
 
     if (cpp.pid > 0) kill(cpp.pid, SIGTERM);
@@ -345,7 +467,6 @@ void UnifiedOrchestrator::exportMetrics(const Config& cfg) {
         const double t_begin = tp_secs(ch.arrival_time);
         double t_end = tp_secs(ch.completion_time);
         if (t_end <= 0.0) t_end = tp_secs(Clock::now());
-
         chunk_tracker_->attachOSMetrics(ch.chunk_id, filter_os(os_all, t_begin, t_end));
 #if HAVE_CUDA
         chunk_tracker_->attachGPUMetrics(ch.chunk_id, filter_gpu(gpu_all, t_begin, t_end));
@@ -379,16 +500,63 @@ void UnifiedOrchestrator::exportMetrics(const Config& cfg) {
     }
 }
 
-// ----------------------------------- CLI -------------------------------------
+// ----------------------------------- CLI & Config ----------------------------
 static void print_usage(const char* argv0) {
     std::cerr <<
     "Usage:\n"
-    "  " << argv0 << " --mode [browser+cpp|cpp-only]\n"
-    "               --server ws://HOST:PORT\n"
+    "  " << argv0 << " [--config FILE.json]\n"
+    "               [--mode browser+cpp|cpp-only]\n"
+    "               [--server ws://HOST:PORT]\n"
     "               [--browser-path PATH] [--browser-url URL]\n"
     "               [--cpp-client PATH]\n"
     "               [--gpu-index N] [--os-interval MS] [--gpu-interval MS]\n"
     "               [--duration SEC] [--out-dir DIR]\n";
+}
+
+static bool load_config(const std::string& path, UnifiedOrchestrator::Config& cfg_out) {
+    std::ifstream f(path);
+    if (!f) {
+        std::cerr << "[Config] Cannot open: " << path << "\n";
+        return false;
+    }
+    json j; f >> j;
+
+    if (j.contains("mode") && j["mode"].is_string()) {
+        // mode handled in main() after parse
+    }
+    if (j.contains("server")) cfg_out.server_path = j["server"].get<std::string>();
+    if (j.contains("gpu_index")) cfg_out.gpu_index = j["gpu_index"].get<unsigned>();
+    if (j.contains("os_interval_ms"))  cfg_out.os_monitor_interval_ms  = j["os_interval_ms"].get<unsigned>();
+    if (j.contains("gpu_interval_ms")) cfg_out.gpu_monitor_interval_ms = j["gpu_interval_ms"].get<unsigned>();
+    if (j.contains("duration_sec")) cfg_out.duration_sec = j["duration_sec"].get<int>();
+    if (j.contains("output_dir")) cfg_out.output_dir = j["output_dir"].get<std::string>();
+    if (j.contains("export_detailed_samples")) cfg_out.export_detailed_samples = j["export_detailed_samples"].get<bool>();
+
+    auto parse_proc = [](const json& jp) -> SpawnSpec {
+        SpawnSpec sp;
+        if (jp.contains("enabled")) sp.enabled = jp["enabled"].get<bool>();
+        if (jp.contains("cwd")) sp.cwd = jp["cwd"].get<std::string>();
+        if (jp.contains("shell")) sp.shell = jp["shell"].get<bool>();
+        if (jp.contains("argv") && jp["argv"].is_array()) {
+            for (const auto& a : jp["argv"]) sp.argv.push_back(a.get<std::string>());
+        }
+        if (jp.contains("env") && jp["env"].is_object()) {
+            for (auto it = jp["env"].begin(); it != jp["env"].end(); ++it) {
+                sp.env[it.key()] = it.value().get<std::string>();
+            }
+        }
+        return sp;
+    };
+
+    if (j.contains("browser") && j["browser"].is_object()) {
+        g_browser_spec = parse_proc(j["browser"]);
+    }
+    if (j.contains("cpp_client") && j["cpp_client"].is_object()) {
+        g_cpp_spec = parse_proc(j["cpp_client"]);
+    }
+
+    // For backward-compat: if no spec provided, leave nullptr and CLI fields will be used.
+    return true;
 }
 
 } // namespace unified_monitor
@@ -403,13 +571,17 @@ int main(int argc, char** argv) {
     std::string mode = "browser+cpp";
     cfg.server_path = "ws://127.0.0.1:8765";
 
+    std::optional<std::string> config_path;
+
+    // -------------------------- CLI parse --------------------------
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto need = [&](const char* name) {
             if (i + 1 >= argc) { std::cerr << name << " requires value\n"; print_usage(argv[0]); std::exit(2); }
             return std::string(argv[++i]);
         };
-        if (a == "--mode") mode = need("--mode");
+        if (a == "--config") config_path = need("--config");
+        else if (a == "--mode") mode = need("--mode");
         else if (a == "--server") cfg.server_path = need("--server");
         else if (a == "--browser-path") cfg.browser_path = need("--browser-path");
         else if (a == "--browser-url") cfg.browser_url = need("--browser-url");
@@ -423,10 +595,26 @@ int main(int argc, char** argv) {
         else { std::cerr << "Unknown arg: " << a << "\n"; print_usage(argv[0]); return 2; }
     }
 
+    // -------------------------- Load config (optional) --------------------------
+    if (config_path) {
+        std::ifstream cf(*config_path);
+        if (!cf.good()) {
+            std::cerr << "[Config] file not found: " << *config_path << "\n";
+            return 2;
+        }
+        json j; cf >> j;
+        // If config specifies mode, override CLI/default
+        if (j.contains("mode") && j["mode"].is_string()) mode = j["mode"].get<std::string>();
+        // Parse the rest
+        load_config(*config_path, cfg);
+    }
+
     UnifiedOrchestrator orch;
-    bool ok = (mode == "browser+cpp") ? orch.runBrowserPlusCpp(cfg)
-             : (mode == "cpp-only")   ? orch.runCppOnly(cfg)
-             : (std::cerr << "Invalid --mode\n", false);
+
+    bool ok = false;
+    if (mode == "browser+cpp") ok = orch.runBrowserPlusCpp(cfg);
+    else if (mode == "cpp-only") ok = orch.runCppOnly(cfg);
+    else { std::cerr << "Invalid --mode\n"; return 2; }
 
     orch.stop();
     return ok ? 0 : 1;
