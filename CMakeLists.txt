@@ -7,22 +7,37 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # --------- Toggle CUDA/NVML features ---------
 option(HAVE_CUDA "Enable CUDA/NVML-based GPU metrics collection" ON)
 
-# Dependencies
-find_package(Boost REQUIRED COMPONENTS system thread)
-find_package(nlohmann_json 3.2.0 REQUIRED)
+# Detect vcpkg toolchain usage
+set(USING_VCPKG OFF)
+if(DEFINED CMAKE_TOOLCHAIN_FILE AND CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg")
+    set(USING_VCPKG ON)
+endif()
 
-# Sources common to all builds
+# Dependencies
+# Boost: only need 'system' (we don't use boost_thread)
+if(USING_VCPKG)
+    # vcpkg provides Boost in CONFIG mode
+    find_package(Boost CONFIG REQUIRED COMPONENTS system)
+else()
+    # system Boost (e.g., 1.74 on Ubuntu)
+    find_package(Boost REQUIRED COMPONENTS system)
+endif()
+
+# nlohmann_json: prefer CONFIG (vcpkg), otherwise normal find (system package)
+find_package(nlohmann_json CONFIG QUIET)
+if(NOT nlohmann_json_FOUND)
+    find_package(nlohmann_json REQUIRED)
+endif()
+
+# Sources
 set(SRCS
     main.cpp
     websocket_proxy.cpp
     csv_export.cpp
     aggregation_export.cpp
     os_metrics_linux.cpp
+    # gpu_listener.cpp  # not needed; GPU collector is implemented in main.cpp
 )
-
-# NOTE: The old gpu_listener.cpp depends on NVML; we don't need it because
-#       GPUMetricsCollector is implemented in main.cpp. If you want to use
-#       that file instead, add it conditionally inside the HAVE_CUDA block.
 
 add_executable(unified_monitor ${SRCS})
 
@@ -34,17 +49,19 @@ target_include_directories(unified_monitor
 target_link_libraries(unified_monitor
     PRIVATE
         Boost::system
-        Boost::thread
         nlohmann_json::nlohmann_json
         pthread
 )
 
+# NVML (CUDA) wiring
 if(HAVE_CUDA)
-    # NVML is typically provided by the NVIDIA driver as libnvidia-ml.so
-    # On many distros, the dev package is 'libnvidia-ml-dev'.
-    find_library(NVML_LIB nvidia-ml)
+    # Allow user to specify exact library: -DNVML_LIB=/path/to/libnvidia-ml.so
     if(NOT NVML_LIB)
-        message(FATAL_ERROR "HAVE_CUDA is ON but NVML library (nvidia-ml) was not found.")
+        find_library(NVML_LIB nvidia-ml)
+    endif()
+    if(NOT NVML_LIB)
+        message(FATAL_ERROR "HAVE_CUDA is ON but NVML library not found. "
+                            "Pass -DNVML_LIB=/path/to/libnvidia-ml.so or set -DHAVE_CUDA=0 to disable.")
     endif()
     target_link_libraries(unified_monitor PRIVATE ${NVML_LIB})
     target_compile_definitions(unified_monitor PRIVATE HAVE_CUDA=1)
@@ -52,11 +69,6 @@ else()
     target_compile_definitions(unified_monitor PRIVATE HAVE_CUDA=0)
 endif()
 
-# Build:
-#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DHAVE_CUDA=0
+# Build notes:
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build -j
-#
-# Run:
-#   ./build/unified_monitor --mode browser+cpp --server ws://127.0.0.1:8765 \
-#       --browser-path /usr/bin/google-chrome --browser-url http://localhost:3000 \
-#       --cpp-client ./cpp_client --out-dir ./metrics
