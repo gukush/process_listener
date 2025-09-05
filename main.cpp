@@ -410,7 +410,9 @@ bool UnifiedOrchestrator::runCppOnly(const Config& cfg) {
     }
     if (cpp.pid > 0) std::cout << "[Spawn] C++ client pid=" << cpp.pid << "\n";
     else std::cerr << "[Spawn] C++ client failed (pid=" << cpp.pid << ")\n";
-
+    if (cfg.enable_proxy) {
+    setupMessageProxy(cfg.server_path);
+    }
     gpu_collector_.reset(new GPUMetricsCollector(cfg.gpu_index));
     os_collector_->startMonitoring(std::vector<pid_t>{ cpp.pid }, cfg.os_monitor_interval_ms);
 #if HAVE_CUDA
@@ -531,7 +533,8 @@ static bool load_config(const std::string& path, UnifiedOrchestrator::Config& cf
     if (j.contains("duration_sec")) cfg_out.duration_sec = j["duration_sec"].get<int>();
     if (j.contains("output_dir")) cfg_out.output_dir = j["output_dir"].get<std::string>();
     if (j.contains("export_detailed_samples")) cfg_out.export_detailed_samples = j["export_detailed_samples"].get<bool>();
-
+    if (j.contains("enable_proxy")) cfg_out.enable_proxy = j["enable_proxy"].get<bool>();
+    if (j.contains("proxy_listen_port")) cfg_out.proxy_listen_port = j["proxy_listen_port"].get<uint16_t>();
     auto parse_proc = [](const json& jp) -> SpawnSpec {
         SpawnSpec sp;
         if (jp.contains("enabled")) sp.enabled = jp["enabled"].get<bool>();

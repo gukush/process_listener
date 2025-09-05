@@ -214,7 +214,8 @@ public:
         std::string browser_path = "/usr/bin/google-chrome";
         std::string browser_url  = "http://localhost:3000";
         std::string cpp_client_path = "./cpp_client";
-
+        bool enable_proxy = true;
+        uint16_t proxy_listen_port = 9797;
         // New: exact commands via config
         CommandSpec browser; // used in mode=browser+cpp
         CommandSpec cpp;     // used in both modes
