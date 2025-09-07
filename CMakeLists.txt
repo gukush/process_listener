@@ -36,10 +36,10 @@ endif()
 # Sources (note: we DO NOT compile orchestrator.cpp; we use orchestrator.hpp)
 set(SRCS
     main.cpp
-    websocket_proxy.cpp
     csv_export.cpp
     aggregation_export.cpp
     os_metrics_linux.cpp
+    gpu_listener.cpp
 )
 
 add_executable(unified_monitor ${SRCS})
