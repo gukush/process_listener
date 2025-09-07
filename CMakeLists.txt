@@ -49,6 +49,8 @@ target_link_libraries(unified_monitor
         Boost::system
         nlohmann_json::nlohmann_json
         pthread
+        ssl
+        crypto
 )
 
 # NVML (CUDA) wiring

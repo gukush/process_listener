@@ -2,7 +2,9 @@
 
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
+#include <boost/beast/websocket/ssl.hpp>
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <nlohmann/json.hpp>
 
 #include <cstdint>

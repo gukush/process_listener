@@ -1,0 +1,28 @@
+{
+  "mode": "browser+cpp",
+  "server": "ws://192.168.1.100:3001",
+  "browser_url": "http://192.168.1.100:3000",
+
+  "browser": {
+    "enabled": true,
+    "argv": ["/usr/bin/google-chrome", "--new-window", "http://127.0.0.1:9797"],
+    "cwd": "/",
+    "env": { "DISPLAY": ":0" },
+    "shell": false
+  },
+
+  "cpp_client": {
+    "enabled": true,
+    "argv": ["./cpp_client", "--server", "ws://127.0.0.1:9798"],
+    "cwd": "/home/user/project",
+    "env": { },
+    "shell": false
+  },
+
+  "gpu_index": 0,
+  "os_interval_ms": 100,
+  "gpu_interval_ms": 50,
+  "duration_sec": 0,
+  "output_dir": "./metrics",
+  "export_detailed_samples": true
+}
