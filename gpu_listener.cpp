@@ -603,12 +603,19 @@ int run_server(unsigned short port, const std::string& host) {
     srv->run();
 
     std::atomic<bool> stop{false};
-    auto onSignal = +[](int){};
 #if defined(_WIN32)
     // Windows: Ctrl+C is handled differently; relying on external stop is fine.
 #else
-    std::signal(SIGINT, [](int){ gpu_listener::MonitorManager::instance().stopAll(); });
-    std::signal(SIGTERM, [](int){ gpu_listener::MonitorManager::instance().stopAll(); });
+    std::signal(SIGINT, [&stop](int){
+        std::cout << "\n[listener] Received SIGINT, shutting down...\n";
+        stop = true;
+        gpu_listener::MonitorManager::instance().stopAll();
+    });
+    std::signal(SIGTERM, [&stop](int){
+        std::cout << "\n[listener] Received SIGTERM, shutting down...\n";
+        stop = true;
+        gpu_listener::MonitorManager::instance().stopAll();
+    });
 #endif
 
     std::thread t([&](){ ioc.run(); });
@@ -616,10 +623,10 @@ int run_server(unsigned short port, const std::string& host) {
     std::cout << "GPU listener on ws://" << host << ":" << port << "  (Ctrl+C to stop)\n";
 #if defined(_WIN32)
     // Busy-wait minimal loop; in real apps, hook proper console ctl handler
-    while (true) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    while (!stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
 #else
     // Sleep until process is terminated; stopAll called in signal handler
-    while (true) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    while (!stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
 #endif
 
     // (Not usually reached)
@@ -645,12 +652,19 @@ int run_server_with_tracker(unsigned short port, const std::string& host, unifie
     srv->run();
 
     std::atomic<bool> stop{false};
-    auto onSignal = +[](int){};
 #if defined(_WIN32)
     // Windows: Ctrl+C is handled differently; relying on external stop is fine.
 #else
-    std::signal(SIGINT, [](int){ gpu_listener::MonitorManager::instance().stopAll(); });
-    std::signal(SIGTERM, [](int){ gpu_listener::MonitorManager::instance().stopAll(); });
+    std::signal(SIGINT, [&stop](int){
+        std::cout << "\n[listener] Received SIGINT, shutting down...\n";
+        stop = true;
+        gpu_listener::MonitorManager::instance().stopAll();
+    });
+    std::signal(SIGTERM, [&stop](int){
+        std::cout << "\n[listener] Received SIGTERM, shutting down...\n";
+        stop = true;
+        gpu_listener::MonitorManager::instance().stopAll();
+    });
 #endif
 
     std::thread t([&](){ ioc.run(); });
@@ -660,10 +674,10 @@ int run_server_with_tracker(unsigned short port, const std::string& host, unifie
 
 #if defined(_WIN32)
     // Busy-wait minimal loop; in real apps, hook proper console ctl handler
-    while (true) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    while (!stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
 #else
     // Sleep until process is terminated; stopAll called in signal handler
-    while (true) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    while (!stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
 #endif
 
     // (Not usually reached)
