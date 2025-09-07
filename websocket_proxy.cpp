@@ -28,6 +28,7 @@ struct BeastWebSocketProxy::Impl {
     std::unique_ptr<tcp::acceptor> acceptor;
     std::string upstream_host;
     uint16_t upstream_port = 0;
+    bool use_ssl = false;
 
     std::atomic<bool> running{false};
 
@@ -50,6 +51,7 @@ struct BeastWebSocketProxy::Impl {
                      tcp::socket&& sock,
                      const std::string& host,
                      uint16_t port,
+                     bool ssl_enabled,
                      EnhancedMessageInterceptor* intr)
             : ioc(ioc_),
               client_socket(std::move(sock)),
@@ -58,7 +60,7 @@ struct BeastWebSocketProxy::Impl {
               interceptor(intr),
               upstream_host(host),
               upstream_port(port),
-              use_ssl(host.find("wss://") == 0 || port == 443) {
+              use_ssl(ssl_enabled) {
             
             if (use_ssl) {
                 ssl::context ctx{ssl::context::tlsv12_client};
@@ -254,7 +256,7 @@ struct BeastWebSocketProxy::Impl {
                 if (!ec) {
                     std::thread([this, sock = std::move(socket)]() mutable {
                         try {
-                            ProxySession sess(ioc, std::move(sock), upstream_host, upstream_port, interceptor);
+                            ProxySession sess(ioc, std::move(sock), upstream_host, upstream_port, use_ssl, interceptor);
                             sess.run();
                         } catch (const std::exception& e) {
                             std::cerr << "[proxy] session crashed: " << e.what() << "\n";
@@ -271,7 +273,7 @@ BeastWebSocketProxy::BeastWebSocketProxy(ChunkTracker* tracker, EnhancedMessageI
 
 BeastWebSocketProxy::~BeastWebSocketProxy() { stop(); }
 
-bool BeastWebSocketProxy::start(uint16_t listen_port, const std::string& upstream_host, uint16_t upstream_port) {
+bool BeastWebSocketProxy::start(uint16_t listen_port, const std::string& upstream_host, uint16_t upstream_port, bool use_ssl) {
     if (impl_->running.exchange(true)) return true;
 
     beast::error_code ec;
@@ -293,12 +295,14 @@ bool BeastWebSocketProxy::start(uint16_t listen_port, const std::string& upstrea
 
     impl_->upstream_host = upstream_host;
     impl_->upstream_port = upstream_port;
+    impl_->use_ssl = use_ssl;
 
     impl_->do_accept();
 
-    io_thread_ = std::thread([this, listen_port, upstream_host, upstream_port]() {
+    io_thread_ = std::thread([this, listen_port, upstream_host, upstream_port, use_ssl]() {
         std::cout << "[proxy] listening on :" << listen_port
-                  << " -> " << upstream_host << ":" << upstream_port << std::endl;
+                  << " -> " << upstream_host << ":" << upstream_port 
+                  << " (SSL=" << (use_ssl ? "yes" : "no") << ")" << std::endl;
         impl_->ioc.run();
     });
 

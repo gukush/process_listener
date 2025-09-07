@@ -34,7 +34,8 @@ public:
     BeastWebSocketProxy(ChunkTracker* tracker, EnhancedMessageInterceptor* interceptor);
     ~BeastWebSocketProxy();
 
-    bool start(uint16_t listen_port, const std::string& upstream_host, uint16_t upstream_port);
+    // Updated to accept SSL parameter
+    bool start(uint16_t listen_port, const std::string& upstream_host, uint16_t upstream_port, bool use_ssl = false);
     void stop();
 
 private:

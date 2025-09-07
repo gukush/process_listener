@@ -301,43 +301,64 @@ UnifiedOrchestrator::UnifiedOrchestrator()
 
 UnifiedOrchestrator::~UnifiedOrchestrator() { stop(); }
 
-static void parse_ws_url(const std::string& url, std::string& host, uint16_t& port) {
-    host = "127.0.0.1"; port = 8765;
+// Enhanced URL parsing that preserves protocol information
+struct ParsedUrl {
+    std::string protocol;  // "ws", "wss", "http", "https"
+    std::string host;
+    uint16_t port;
+    bool use_ssl;
+};
+
+static ParsedUrl parse_url(const std::string& url) {
+    ParsedUrl result;
+    result.host = "127.0.0.1";
+    result.port = 8765;
+    result.use_ssl = false;
+    result.protocol = "ws";
+    
     try {
         std::string u = url;
-        auto pos_ws = u.find("://");
-        if (pos_ws != std::string::npos) u = u.substr(pos_ws + 3);
+        auto pos_protocol = u.find("://");
+        if (pos_protocol != std::string::npos) {
+            result.protocol = u.substr(0, pos_protocol);
+            u = u.substr(pos_protocol + 3);
+            
+            // Determine SSL usage
+            result.use_ssl = (result.protocol == "wss" || result.protocol == "https");
+        }
+        
         auto colon = u.find(':');
         auto slash = u.find('/');
         if (colon != std::string::npos) {
-            host = u.substr(0, colon);
+            result.host = u.substr(0, colon);
             std::string p = (slash == std::string::npos) ? u.substr(colon + 1)
                                                          : u.substr(colon + 1, slash - colon - 1);
-            port = static_cast<uint16_t>(std::stoi(p));
+            result.port = static_cast<uint16_t>(std::stoi(p));
         } else {
-            host = (slash == std::string::npos) ? u : u.substr(0, slash);
+            result.host = (slash == std::string::npos) ? u : u.substr(0, slash);
         }
     } catch (...) {}
+    
+    return result;
 }
 
 void UnifiedOrchestrator::setupMessageProxy(const std::string& upstreamUrl) {
-    std::string host; uint16_t port;
-    parse_ws_url(upstreamUrl, host, port);
-
+    ParsedUrl parsed = parse_url(upstreamUrl);
+    
     // Proxy 1: Browser Socket.IO (port 9797 -> remote_host:3000)
     static std::unique_ptr<BeastWebSocketProxy> s_proxy_browser;
     if (!s_proxy_browser) s_proxy_browser.reset(new BeastWebSocketProxy(chunk_tracker_.get(),
                                                                         new ProxyMessageInterceptor(chunk_tracker_.get())));
-    bool ok1 = s_proxy_browser->start(9797, host, 3000);
-
-    // Proxy 2: Native WebSocket (port 9798 -> remote_host:3001)
+    bool ok1 = s_proxy_browser->start(9797, parsed.host, 3000, parsed.use_ssl);
+    
+    // Proxy 2: Native WebSocket (port 9798 -> remote_host:3001)  
     static std::unique_ptr<BeastWebSocketProxy> s_proxy_native;
     if (!s_proxy_native) s_proxy_native.reset(new BeastWebSocketProxy(chunk_tracker_.get(),
                                                                       new ProxyMessageInterceptor(chunk_tracker_.get())));
-    bool ok2 = s_proxy_native->start(9798, host, 3001);
-
+    bool ok2 = s_proxy_native->start(9798, parsed.host, 3001, parsed.use_ssl);
+    
     if (!ok1 || !ok2) std::cerr << "[Orchestrator] WS proxy start failed\n";
-    else std::cout << "[Orchestrator] Dual WS proxy started (9797->" << host << ":3000, 9798->" << host << ":3001)\n";
+    else std::cout << "[Orchestrator] Dual WS proxy started (9797->" << parsed.host << ":3000, 9798->" << parsed.host << ":3001, SSL=" << (parsed.use_ssl ? "yes" : "no") << ")\n";
 }
 
 bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
