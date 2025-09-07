@@ -27,6 +27,12 @@ if(NOT nlohmann_json_FOUND)
     find_package(nlohmann_json REQUIRED)
 endif()
 
+# OpenSSL: prefer CONFIG (vcpkg), otherwise system package
+find_package(OpenSSL CONFIG QUIET)
+if(NOT OpenSSL_FOUND)
+    find_package(OpenSSL REQUIRED)
+endif()
+
 # Sources (note: we DO NOT compile orchestrator.cpp; we use orchestrator.hpp)
 set(SRCS
     main.cpp
@@ -48,9 +54,9 @@ target_link_libraries(unified_monitor
     PRIVATE
         Boost::system
         nlohmann_json::nlohmann_json
+        OpenSSL::SSL
+        OpenSSL::Crypto
         pthread
-        ssl
-        crypto
 )
 
 # NVML (CUDA) wiring
