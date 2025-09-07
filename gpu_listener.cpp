@@ -11,6 +11,13 @@ namespace gpu_listener {
 static std::atomic<bool> g_stop_requested{false};
 
 static void handle_signal(int sig) {
+    static bool shutdown_initiated = false;
+    if (shutdown_initiated) {
+        std::cout << "\n[listener] Force exit...\n";
+        std::exit(1);
+    }
+    shutdown_initiated = true;
+
     std::cout << "\n[listener] Received signal " << sig << ", shutting down...\n";
     g_stop_requested = true;
     MonitorManager::instance().stopAll();
@@ -629,11 +636,12 @@ int run_server(unsigned short port, const std::string& host) {
     while (!g_stop_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
 #endif
 
-    // (Not usually reached)
+    std::cout << "[listener] Shutdown requested, cleaning up...\n";
     gpu_listener::MonitorManager::instance().stopAll();
     ioc.stop();
     t.join();
     nvmlShutdown();
+    std::cout << "[listener] Cleanup complete, exiting.\n";
     return 0;
 }
 
@@ -672,11 +680,12 @@ int run_server_with_tracker(unsigned short port, const std::string& host, unifie
     while (!g_stop_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
 #endif
 
-    // (Not usually reached)
+    std::cout << "[listener] Shutdown requested, cleaning up...\n";
     gpu_listener::MonitorManager::instance().stopAll();
     ioc.stop();
     t.join();
     nvmlShutdown();
+    std::cout << "[listener] Cleanup complete, exiting.\n";
     return 0;
 }
 
