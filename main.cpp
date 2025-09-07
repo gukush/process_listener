@@ -315,18 +315,18 @@ static ParsedUrl parse_url(const std::string& url) {
     result.port = 8765;
     result.use_ssl = false;
     result.protocol = "ws";
-    
+
     try {
         std::string u = url;
         auto pos_protocol = u.find("://");
         if (pos_protocol != std::string::npos) {
             result.protocol = u.substr(0, pos_protocol);
             u = u.substr(pos_protocol + 3);
-            
+
             // Determine SSL usage
             result.use_ssl = (result.protocol == "wss" || result.protocol == "https");
         }
-        
+
         auto colon = u.find(':');
         auto slash = u.find('/');
         if (colon != std::string::npos) {
@@ -338,27 +338,30 @@ static ParsedUrl parse_url(const std::string& url) {
             result.host = (slash == std::string::npos) ? u : u.substr(0, slash);
         }
     } catch (...) {}
-    
+
     return result;
 }
 
 void UnifiedOrchestrator::setupMessageProxy(const std::string& upstreamUrl) {
     ParsedUrl parsed = parse_url(upstreamUrl);
-    
+
     // Proxy 1: Browser Socket.IO (port 9797 -> remote_host:3000)
     static std::unique_ptr<BeastWebSocketProxy> s_proxy_browser;
     if (!s_proxy_browser) s_proxy_browser.reset(new BeastWebSocketProxy(chunk_tracker_.get(),
                                                                         new ProxyMessageInterceptor(chunk_tracker_.get())));
     bool ok1 = s_proxy_browser->start(9797, parsed.host, 3000, parsed.use_ssl);
-    
-    // Proxy 2: Native WebSocket (port 9798 -> remote_host:3001)  
+
+    // Proxy 2: Native WebSocket (port 9798 -> remote_host:3001)
     static std::unique_ptr<BeastWebSocketProxy> s_proxy_native;
     if (!s_proxy_native) s_proxy_native.reset(new BeastWebSocketProxy(chunk_tracker_.get(),
                                                                       new ProxyMessageInterceptor(chunk_tracker_.get())));
     bool ok2 = s_proxy_native->start(9798, parsed.host, 3001, parsed.use_ssl);
-    
+
     if (!ok1 || !ok2) std::cerr << "[Orchestrator] WS proxy start failed\n";
-    else std::cout << "[Orchestrator] Dual WS proxy started (9797->" << parsed.host << ":3000, 9798->" << parsed.host << ":3001, SSL=" << (parsed.use_ssl ? "yes" : "no") << ")\n";
+    else {
+        std::cout << "[Orchestrator] Dual WS proxy started (9797->" << parsed.host << ":3000, 9798->" << parsed.host << ":3001, SSL=" << (parsed.use_ssl ? "yes" : "no") << ")\n";
+        std::cout << "[Orchestrator] Proxy URLs: Browser->http://127.0.0.1:9797, C++->ws://127.0.0.1:9798\n";
+    }
 }
 
 bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
@@ -379,11 +382,44 @@ bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
         if (cfg.server_path.find("://") != std::string::npos) {
             browser_url = "http://127.0.0.1:9797";
         }
-        sp.argv = { cfg.browser_path, "--new-window", browser_url };
+        sp.argv = {
+            cfg.browser_path,
+            "--new-window",
+            "--disable-logging",
+            "--disable-gpu-logging",
+            "--disable-gpu-sandbox",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-extensions",
+            "--disable-plugins",
+            "--disable-images",
+            "--disable-javascript",
+            "--disable-web-security",
+            "--ignore-certificate-errors",
+            "--ignore-ssl-errors",
+            "--ignore-certificate-errors-spki-list",
+            "--ignore-urlfetcher-cert-requests",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=TranslateUI",
+            "--disable-ipc-flooding-protection",
+            "--log-level=3",
+            "--silent",
+            browser_url
+        };
         browser = spawn_process(sp);
     }
-    if (browser.pid > 0) std::cout << "[Spawn] Browser pid=" << browser.pid << "\n";
-    else std::cerr << "[Spawn] Browser failed (pid=" << browser.pid << ")\n";
+    if (browser.pid > 0) {
+        std::cout << "[Spawn] Browser pid=" << browser.pid << " connecting to: " << browser_url << "\n";
+        std::cout << "[Spawn] Browser command: ";
+        for (const auto& arg : sp.argv) {
+            std::cout << arg << " ";
+        }
+        std::cout << "\n";
+    } else {
+        std::cerr << "[Spawn] Browser failed (pid=" << browser.pid << ")\n";
+    }
 
     if (g_cpp_spec && g_cpp_spec->enabled) {
         cpp = spawn_process(*g_cpp_spec);
@@ -392,8 +428,10 @@ bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
         // If using remote server, redirect C++ client to local proxy
         if (cfg.server_path.find("://") != std::string::npos) {
             sp.argv = { cfg.cpp_client_path, "--server", "ws://127.0.0.1:9798" };
+            std::cout << "[Spawn] C++ client connecting to proxy: ws://127.0.0.1:9798\n";
         } else {
             sp.argv = { cfg.cpp_client_path };
+            std::cout << "[Spawn] C++ client connecting directly to server\n";
         }
         cpp = spawn_process(sp);
     }

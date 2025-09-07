@@ -6,6 +6,7 @@
 #include <boost/beast/websocket/ssl.hpp>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/algorithm/string.hpp>
 
 #include <iostream>
 #include <atomic>
@@ -61,7 +62,7 @@ struct BeastWebSocketProxy::Impl {
               upstream_host(host),
               upstream_port(port),
               use_ssl(ssl_enabled) {
-            
+
             if (use_ssl) {
                 ssl::context ctx{ssl::context::tlsv12_client};
                 ctx.set_default_verify_paths();
@@ -74,8 +75,60 @@ struct BeastWebSocketProxy::Impl {
 
         void run() {
             beast::error_code ec;
-            client_ws.accept(ec);
-            if (ec) { std::cerr << "[proxy] client accept error: " << ec.message() << "\n"; return; }
+
+            // Debug: Log the incoming request
+            std::cout << "[proxy] Accepting WebSocket connection from client\n";
+            std::cout << "[proxy] Target upstream: " << upstream_host << ":" << upstream_port << " (SSL=" << (use_ssl ? "yes" : "no") << ")\n";
+
+            // Try to get more info about the incoming request before accepting
+            try {
+                // Read the HTTP request to see what we're getting
+                beast::flat_buffer buffer;
+                http::request<http::string_body> req;
+                http::read(client_ws.next_layer(), buffer, req, ec);
+
+                if (!ec) {
+                    std::cout << "[proxy] Incoming HTTP request:\n";
+                    std::cout << "[proxy] Method: " << req.method_string() << "\n";
+                    std::cout << "[proxy] Target: " << req.target() << "\n";
+                    std::cout << "[proxy] Version: " << req.version() << "\n";
+                    std::cout << "[proxy] Headers count: " << req.size() << "\n";
+
+                    // Check if it's a WebSocket upgrade request
+                    bool is_websocket_upgrade = false;
+                    for (auto const& header : req) {
+                        std::cout << "[proxy] Header: " << header.name_string() << " = " << header.value() << "\n";
+                        if (boost::iequals(header.name_string(), "upgrade") &&
+                            boost::iequals(header.value(), "websocket")) {
+                            is_websocket_upgrade = true;
+                        }
+                    }
+
+                    if (!is_websocket_upgrade) {
+                        std::cerr << "[proxy] ERROR: Not a WebSocket upgrade request!\n";
+                        std::cerr << "[proxy] This looks like a regular HTTP request, not WebSocket\n";
+                        return;
+                    }
+
+                    // Now try to accept the WebSocket upgrade
+                    client_ws.accept(req, ec);
+                } else {
+                    std::cerr << "[proxy] Failed to read HTTP request: " << ec.message() << "\n";
+                    return;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[proxy] Exception during request parsing: " << e.what() << "\n";
+                return;
+            }
+
+            if (ec) {
+                std::cerr << "[proxy] client accept error: " << ec.message() << "\n";
+                std::cerr << "[proxy] Error category: " << ec.category().name() << "\n";
+                std::cerr << "[proxy] Error value: " << ec.value() << "\n";
+                return;
+            }
+
+            std::cout << "[proxy] WebSocket handshake successful, connecting to upstream: " << upstream_host << ":" << upstream_port << "\n";
 
             auto results = resolver.resolve(upstream_host, std::to_string(upstream_port), ec);
             if (ec) { std::cerr << "[proxy] resolve error: " << ec.message() << "\n"; return; }
@@ -94,16 +147,16 @@ struct BeastWebSocketProxy::Impl {
                 // SSL WebSocket connection
                 auto ep = boost::asio::connect(upstream_ws_ssl->next_layer().next_layer(), results, ec);
                 if (ec) { std::cerr << "[proxy] SSL connect error: " << ec.message() << "\n"; return; }
-                
+
                 upstream_ws_ssl->next_layer().handshake(ssl::stream_base::client, ec);
                 if (ec) { std::cerr << "[proxy] SSL handshake error: " << ec.message() << "\n"; return; }
-                
+
                 upstream_ws_ssl->set_option(websocket::stream_base::timeout{
                     std::chrono::seconds(30),
                     std::chrono::seconds(30),
                     true
                 });
-                
+
                 upstream_ws_ssl->handshake(upstream_host, path, ec);
                 if (ec) { std::cerr << "[proxy] SSL WS handshake error: " << ec.message() << "\n"; return; }
             } else {
@@ -116,7 +169,7 @@ struct BeastWebSocketProxy::Impl {
                     std::chrono::seconds(30),
                     true
                 });
-                
+
                 upstream_ws->handshake(upstream_host, path, ec);
                 if (ec) { std::cerr << "[proxy] handshake error: " << ec.message() << "\n"; return; }
             }
@@ -160,7 +213,7 @@ struct BeastWebSocketProxy::Impl {
                         if (j.contains("type") && j.contains("data")) {
                             std::string type = j["type"].get<std::string>();
                             const auto& data = j["data"];
-                            
+
                             // Map native message types to chunk events
                             if (type == "workload:new") {
                                 // This is a task initialization
@@ -301,7 +354,7 @@ bool BeastWebSocketProxy::start(uint16_t listen_port, const std::string& upstrea
 
     io_thread_ = std::thread([this, listen_port, upstream_host, upstream_port, use_ssl]() {
         std::cout << "[proxy] listening on :" << listen_port
-                  << " -> " << upstream_host << ":" << upstream_port 
+                  << " -> " << upstream_host << ":" << upstream_port
                   << " (SSL=" << (use_ssl ? "yes" : "no") << ")" << std::endl;
         impl_->ioc.run();
     });

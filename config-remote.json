@@ -1,7 +1,7 @@
 {
   "mode": "browser+cpp",
-  "server": "ws://192.168.1.100:3001",
-  "browser_url": "http://192.168.1.100:3000",
+  "server": "wss://127.0.0.1:3001",
+  "browser_url": "https://127.0.0.1:3000",
 
   "browser": {
     "enabled": true,
