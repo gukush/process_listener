@@ -630,8 +630,6 @@ int run_server(unsigned short port, const std::string& host) {
     return 0;
 }
 
-} // namespace gpu_listener
-
 // -------------------- Enhanced server with ChunkTracker integration --------------------
 int run_server_with_tracker(unsigned short port, const std::string& host, unified_monitor::ChunkTracker* tracker) {
     // NVML init early to report errors upfront
@@ -676,11 +674,5 @@ int run_server_with_tracker(unsigned short port, const std::string& host, unifie
     return 0;
 }
 
-// -------------------- main --------------------
-int main(int argc, char** argv) {
-    unsigned short port = 8765;
-    std::string host = "127.0.0.1";
-    if (argc >= 2) port = static_cast<unsigned short>(std::stoi(argv[1]));
-    if (argc >= 3) host = argv[2];
-    return gpu_listener::run_server(port, host);
-}
+} // namespace gpu_listener
+
