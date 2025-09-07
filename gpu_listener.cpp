@@ -566,10 +566,10 @@ void WsSession::fail(beast::error_code ec, const char* what) {
 WsListener::WsListener(boost::asio::io_context& ioc, tcp::endpoint ep, unified_monitor::ChunkTracker* tracker)
     : ioc_(ioc), acceptor_(ioc), chunk_tracker_(tracker) {
     beast::error_code ec;
-    acceptor_.open(ep.protocol(), ec); if (ec) return fail(ec, "open");
-    acceptor_.set_option(boost::asio::socket_base::reuse_address(true), ec); if (ec) return fail(ec, "set_option");
-    acceptor_.bind(ep, ec); if (ec) return fail(ec, "bind");
-    acceptor_.listen(boost::asio::socket_base::max_listen_connections, ec); if (ec) return fail(ec, "listen");
+    acceptor_.open(ep.protocol(), ec); if (ec) { fail(ec, "open"); return; }
+    acceptor_.set_option(boost::asio::socket_base::reuse_address(true), ec); if (ec) { fail(ec, "set_option"); return; }
+    acceptor_.bind(ep, ec); if (ec) { fail(ec, "bind"); return; }
+    acceptor_.listen(boost::asio::socket_base::max_listen_connections, ec); if (ec) { fail(ec, "listen"); return; }
 }
 void WsListener::run() { doAccept(); }
 void WsListener::doAccept() {

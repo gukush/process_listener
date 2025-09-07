@@ -348,14 +348,14 @@ bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
 
     // 2) Spawn processes (use config overrides if provided)
     ChildProcess browser{-1}, cpp{-1};
+    SpawnSpec browser_sp;
     if (g_browser_spec && g_browser_spec->enabled) {
         browser = spawn_process(*g_browser_spec);
     } else {
         // Use original server URL for browser
-        SpawnSpec sp;
         std::string browser_url = cfg.browser_url;
-        sp.argv = { cfg.browser_path, "--new-window", browser_url };
-        browser = spawn_process(sp);
+        browser_sp.argv = { cfg.browser_path, "--new-window", browser_url };
+        browser = spawn_process(browser_sp);
     }
     if (browser.pid > 0) {
         std::cout << "[Spawn] Browser pid=" << browser.pid << " connecting to: " << cfg.browser_url << "\n";
@@ -365,7 +365,7 @@ bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
                 std::cout << arg << " ";
             }
         } else {
-            for (const auto& arg : sp.argv) {
+            for (const auto& arg : browser_sp.argv) {
                 std::cout << arg << " ";
             }
         }
