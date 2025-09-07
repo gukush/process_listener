@@ -15,6 +15,7 @@ namespace unified_monitor {
 using tcp = boost::asio::ip::tcp;
 namespace websocket = boost::beast::websocket;
 namespace beast = boost::beast;
+namespace ssl = boost::asio::ssl;  // Add SSL namespace alias
 
 struct BeastWebSocketProxy::Impl {
     explicit Impl(ChunkTracker* tr, EnhancedMessageInterceptor* in)
@@ -58,7 +59,7 @@ struct BeastWebSocketProxy::Impl {
               upstream_host(host),
               upstream_port(port),
               use_ssl(host.find("wss://") == 0 || port == 443) {
-
+            
             if (use_ssl) {
                 ssl::context ctx{ssl::context::tlsv12_client};
                 ctx.set_default_verify_paths();
@@ -91,16 +92,16 @@ struct BeastWebSocketProxy::Impl {
                 // SSL WebSocket connection
                 auto ep = boost::asio::connect(upstream_ws_ssl->next_layer().next_layer(), results, ec);
                 if (ec) { std::cerr << "[proxy] SSL connect error: " << ec.message() << "\n"; return; }
-
+                
                 upstream_ws_ssl->next_layer().handshake(ssl::stream_base::client, ec);
                 if (ec) { std::cerr << "[proxy] SSL handshake error: " << ec.message() << "\n"; return; }
-
+                
                 upstream_ws_ssl->set_option(websocket::stream_base::timeout{
                     std::chrono::seconds(30),
                     std::chrono::seconds(30),
                     true
                 });
-
+                
                 upstream_ws_ssl->handshake(upstream_host, path, ec);
                 if (ec) { std::cerr << "[proxy] SSL WS handshake error: " << ec.message() << "\n"; return; }
             } else {
@@ -113,7 +114,7 @@ struct BeastWebSocketProxy::Impl {
                     std::chrono::seconds(30),
                     true
                 });
-
+                
                 upstream_ws->handshake(upstream_host, path, ec);
                 if (ec) { std::cerr << "[proxy] handshake error: " << ec.message() << "\n"; return; }
             }
@@ -157,7 +158,7 @@ struct BeastWebSocketProxy::Impl {
                         if (j.contains("type") && j.contains("data")) {
                             std::string type = j["type"].get<std::string>();
                             const auto& data = j["data"];
-
+                            
                             // Map native message types to chunk events
                             if (type == "workload:new") {
                                 // This is a task initialization
