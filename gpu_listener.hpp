@@ -20,6 +20,11 @@
 #include <nlohmann/json.hpp>
 #include <nvml.h>
 
+// Forward declaration for ChunkTracker
+namespace unified_monitor {
+    class ChunkTracker;
+}
+
 namespace gpu_listener {
 
 using tcp = boost::asio::ip::tcp;
@@ -186,11 +191,6 @@ private:
 
 // Entrypoint helper (optional)
 int run_server(unsigned short port = 8765, const std::string& host = "127.0.0.1");
-
-// Forward declaration for ChunkTracker
-namespace unified_monitor {
-    class ChunkTracker;
-}
 
 // Enhanced entrypoint that integrates with orchestrator
 int run_server_with_tracker(unsigned short port, const std::string& host, unified_monitor::ChunkTracker* tracker);

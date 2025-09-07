@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <csignal>
 #include <iomanip>
+#include <iostream>
 
 namespace gpu_listener {
 
@@ -32,7 +33,7 @@ bool NvmlDevice::getPowerMilliwatts(unsigned int& mw) const {
     return st == NVML_SUCCESS;
 }
 bool NvmlDevice::getUtilization(unsigned int& gpu, unsigned int& mem) const {
-    nvmlUtilizationRates_t r{};
+    nvmlUtilization_t r{};
     auto st = nvmlDeviceGetUtilizationRates(handle_, &r);
     if (st != NVML_SUCCESS) return false;
     gpu = r.gpu; mem = r.memory; return true;
@@ -68,10 +69,10 @@ NvmlDevice::getPerPidGpuPercent(unsigned long long last_seen_usec) const {
     // Fallback: just enumerate running processes, set 0%
     unsigned int count = 256;
     std::vector<nvmlProcessInfo_t> procs(count);
-    auto st1 = nvmlDeviceGetComputeRunningProcesses_v2(handle_, &count, procs.data());
+    auto st1 = nvmlDeviceGetComputeRunningProcesses_v3(handle_, &count, procs.data());
     if (st1 == NVML_ERROR_INSUFFICIENT_SIZE) {
         procs.resize(count);
-        st1 = nvmlDeviceGetComputeRunningProcesses_v2(handle_, &count, procs.data());
+        st1 = nvmlDeviceGetComputeRunningProcesses_v3(handle_, &count, procs.data());
     }
     if (st1 == NVML_SUCCESS) {
         for (unsigned i=0;i<count;i++) out[procs[i].pid] = 0;
@@ -406,13 +407,13 @@ void MonitorSession::write_chunk_logs(const NvmlSummary& s, const json& as_json,
 
 // -------------------- MonitorManager --------------------
 
-MonitorManager& MonitorManager::instance() {
+MonitorManager& gpu_listener::MonitorManager::instance() {
     static MonitorManager m;
     return m;
 }
 
 std::shared_ptr<MonitorSession>
-MonitorManager::start(const std::string& chunk_id, unsigned gpu_index, std::optional<unsigned> pid_hint) {
+gpu_listener::MonitorManager::start(const std::string& chunk_id, unsigned gpu_index, std::optional<unsigned> pid_hint) {
     std::lock_guard<std::mutex> lk(mu_);
     if (sessions_.count(chunk_id)) return nullptr;
     auto s = std::make_shared<MonitorSession>();
@@ -423,7 +424,7 @@ MonitorManager::start(const std::string& chunk_id, unsigned gpu_index, std::opti
     return s;
 }
 
-json MonitorManager::end(const std::string& chunk_id) {
+json gpu_listener::MonitorManager::end(const std::string& chunk_id) {
     std::shared_ptr<MonitorSession> s;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -438,7 +439,7 @@ json MonitorManager::end(const std::string& chunk_id) {
     return j;
 }
 
-void MonitorManager::stopAll() {
+void gpu_listener::MonitorManager::stopAll() {
     std::lock_guard<std::mutex> lk(mu_);
     for (auto& kv : sessions_) kv.second->stopAndSummarize();
     sessions_.clear();
@@ -529,7 +530,7 @@ void WsSession::handleMessage(const json& obj) {
 
     if (status == 0) {
         // Start monitoring and notify ChunkTracker
-        auto s = MonitorManager::instance().start(cid, gpu_index, pid);
+        auto s = gpu_listener::MonitorManager::instance().start(cid, gpu_index, pid);
         if (!s) { write(errorMsg("already_running","Monitoring already running for this chunk_id")); return; }
 
         // Notify ChunkTracker if available
@@ -542,7 +543,7 @@ void WsSession::handleMessage(const json& obj) {
         write(json{{"type","ack"},{"chunk_id",cid},{"status",0}});
     } else if (status == 1 || status == -1) {
         // End monitoring and notify ChunkTracker
-        auto sum = MonitorManager::instance().end(cid);
+        auto sum = gpu_listener::MonitorManager::instance().end(cid);
         sum["type"] = (status==1 ? "summary" : "summary_error");
 
         // Notify ChunkTracker if available
@@ -606,8 +607,8 @@ int run_server(unsigned short port, const std::string& host) {
 #if defined(_WIN32)
     // Windows: Ctrl+C is handled differently; relying on external stop is fine.
 #else
-    std::signal(SIGINT, [](int){ MonitorManager::instance().stopAll(); });
-    std::signal(SIGTERM, [](int){ MonitorManager::instance().stopAll(); });
+    std::signal(SIGINT, [](int){ gpu_listener::MonitorManager::instance().stopAll(); });
+    std::signal(SIGTERM, [](int){ gpu_listener::MonitorManager::instance().stopAll(); });
 #endif
 
     std::thread t([&](){ ioc.run(); });
@@ -622,7 +623,7 @@ int run_server(unsigned short port, const std::string& host) {
 #endif
 
     // (Not usually reached)
-    MonitorManager::instance().stopAll();
+    gpu_listener::MonitorManager::instance().stopAll();
     ioc.stop();
     t.join();
     nvmlShutdown();
@@ -636,13 +637,13 @@ int run_server_with_tracker(unsigned short port, const std::string& host, unifie
     // NVML init early to report errors upfront
     nvmlReturn_t st = nvmlInit_v2();
     if (st != NVML_SUCCESS && st != NVML_ERROR_ALREADY_INITIALIZED) {
-        std::cerr << "NVML init failed at startup: " << nvmlErrorStr(st) << "\n";
+        std::cerr << "NVML init failed at startup: " << gpu_listener::nvmlErrorStr(st) << "\n";
         return 1;
     }
 
     boost::asio::io_context ioc{1};
-    auto ep = tcp::endpoint(boost::asio::ip::make_address(host), port);
-    auto srv = std::make_shared<WsListener>(ioc, ep, tracker);
+    auto ep = boost::asio::ip::tcp::endpoint(boost::asio::ip::make_address(host), port);
+    auto srv = std::make_shared<gpu_listener::WsListener>(ioc, ep, tracker);
     srv->run();
 
     std::atomic<bool> stop{false};
@@ -650,8 +651,8 @@ int run_server_with_tracker(unsigned short port, const std::string& host, unifie
 #if defined(_WIN32)
     // Windows: Ctrl+C is handled differently; relying on external stop is fine.
 #else
-    std::signal(SIGINT, [](int){ MonitorManager::instance().stopAll(); });
-    std::signal(SIGTERM, [](int){ MonitorManager::instance().stopAll(); });
+    std::signal(SIGINT, [](int){ gpu_listener::MonitorManager::instance().stopAll(); });
+    std::signal(SIGTERM, [](int){ gpu_listener::MonitorManager::instance().stopAll(); });
 #endif
 
     std::thread t([&](){ ioc.run(); });
@@ -668,7 +669,7 @@ int run_server_with_tracker(unsigned short port, const std::string& host, unifie
 #endif
 
     // (Not usually reached)
-    MonitorManager::instance().stopAll();
+    gpu_listener::MonitorManager::instance().stopAll();
     ioc.stop();
     t.join();
     nvmlShutdown();

@@ -360,8 +360,14 @@ bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
     if (browser.pid > 0) {
         std::cout << "[Spawn] Browser pid=" << browser.pid << " connecting to: " << cfg.browser_url << "\n";
         std::cout << "[Spawn] Browser command: ";
-        for (const auto& arg : sp.argv) {
-            std::cout << arg << " ";
+        if (g_browser_spec && g_browser_spec->enabled) {
+            for (const auto& arg : g_browser_spec->argv) {
+                std::cout << arg << " ";
+            }
+        } else {
+            for (const auto& arg : sp.argv) {
+                std::cout << arg << " ";
+            }
         }
         std::cout << "\n";
     } else {
