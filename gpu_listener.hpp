@@ -15,10 +15,18 @@
 #include <vector>
 
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <boost/beast.hpp>
+#include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
+#include <boost/beast/websocket/ssl.hpp>
 #include <nlohmann/json.hpp>
+
+#if HAVE_CUDA
 #include <nvml.h>
+#else
+#include "nvml_stub.h"
+#endif
 
 // Forward declaration for ChunkTracker
 namespace unified_monitor {
@@ -189,10 +197,49 @@ private:
     static void fail(beast::error_code ec, const char* what);
 };
 
+// SSL WebSocket session
+class WssSession : public std::enable_shared_from_this<WssSession> {
+public:
+    WssSession(boost::asio::ssl::stream<tcp::socket> stream, unified_monitor::ChunkTracker* tracker = nullptr);
+    void run();
+private:
+    boost::asio::ssl::stream<tcp::socket> stream_;
+    beast::websocket::stream<boost::asio::ssl::stream<tcp::socket>&> ws_;
+    beast::flat_buffer buffer_;
+    unified_monitor::ChunkTracker* chunk_tracker_;
+
+    void onHandshake(beast::error_code ec);
+    void onAccept(beast::error_code ec);
+    void doRead();
+    void onRead(beast::error_code ec, std::size_t bytes_transferred);
+    void onWrite(beast::error_code ec, std::size_t);
+    static json errorMsg(const std::string& code, const std::string& msg);
+    void handleMessage(const json& obj);
+    static void fail(beast::error_code ec, const char* what);
+};
+
+// SSL WebSocket listener
+class WssListener : public std::enable_shared_from_this<WssListener> {
+public:
+    WssListener(boost::asio::io_context& ioc, boost::asio::ssl::context& ctx, tcp::endpoint ep, unified_monitor::ChunkTracker* tracker = nullptr);
+    void run();
+private:
+    boost::asio::io_context& ioc_;
+    boost::asio::ssl::context& ctx_;
+    tcp::acceptor acceptor_;
+    unified_monitor::ChunkTracker* chunk_tracker_;
+    void doAccept();
+    void onAccept(beast::error_code ec, tcp::socket socket);
+    static void fail(beast::error_code ec, const char* what);
+};
+
 // Entrypoint helper (optional)
 int run_server(unsigned short port = 8765, const std::string& host = "127.0.0.1");
 
 // Enhanced entrypoint that integrates with orchestrator
 int run_server_with_tracker(unsigned short port, const std::string& host, unified_monitor::ChunkTracker* tracker);
+
+// SSL WebSocket server entrypoint
+int run_ssl_server_with_tracker(unsigned short port, const std::string& host, const std::string& cert_file, const std::string& key_file, unified_monitor::ChunkTracker* tracker);
 
 } // namespace gpu_listener

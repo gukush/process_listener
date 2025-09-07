@@ -90,6 +90,40 @@ if(HAVE_CUDA)
     target_compile_definitions(unified_monitor PRIVATE HAVE_CUDA=1)
 else()
     target_compile_definitions(unified_monitor PRIVATE HAVE_CUDA=0)
+    # Create a stub nvml.h for compilation when CUDA is disabled
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/nvml_stub.h
+"#ifndef NVML_STUB_H
+#define NVML_STUB_H
+
+// Stub NVML definitions for when CUDA is disabled
+typedef int nvmlReturn_t;
+typedef void* nvmlDevice_t;
+typedef struct { unsigned int gpu; unsigned int memory; } nvmlUtilization_t;
+typedef struct { unsigned int gpu; unsigned int memory; } nvmlUtilizationRates_t;
+typedef struct { unsigned long long used; } nvmlMemory_t;
+typedef struct { unsigned int pid; unsigned int smUtil; } nvmlProcessUtilizationSample_t;
+typedef struct { unsigned int pid; } nvmlProcessInfo_t;
+
+#define NVML_SUCCESS 0
+#define NVML_ERROR_ALREADY_INITIALIZED 1
+#define NVML_ERROR_INSUFFICIENT_SIZE 2
+#define NVML_CLOCK_SM 0
+
+inline nvmlReturn_t nvmlInit_v2() { return NVML_SUCCESS; }
+inline nvmlReturn_t nvmlShutdown() { return NVML_SUCCESS; }
+inline nvmlReturn_t nvmlDeviceGetHandleByIndex_v2(unsigned int, nvmlDevice_t*) { return NVML_SUCCESS; }
+inline nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t, unsigned int*) { return NVML_SUCCESS; }
+inline nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t, nvmlUtilizationRates_t*) { return NVML_SUCCESS; }
+inline nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t, nvmlMemory_t*) { return NVML_SUCCESS; }
+inline nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t, int, unsigned int*) { return NVML_SUCCESS; }
+inline nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t, nvmlProcessUtilizationSample_t*, unsigned int*, unsigned long long) { return NVML_SUCCESS; }
+inline nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(nvmlDevice_t, unsigned int*, nvmlProcessInfo_t*) { return NVML_SUCCESS; }
+inline nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v3(nvmlDevice_t, unsigned int*, nvmlProcessInfo_t*) { return NVML_SUCCESS; }
+inline const char* nvmlErrorString(nvmlReturn_t) { return \"NVML disabled\"; }
+
+#endif
+")
+    target_include_directories(unified_monitor PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 endif()
 
 # Build:

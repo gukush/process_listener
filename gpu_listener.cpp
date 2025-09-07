@@ -8,21 +8,6 @@
 
 namespace gpu_listener {
 
-static std::atomic<bool> g_stop_requested{false};
-
-static void handle_signal(int sig) {
-    static bool shutdown_initiated = false;
-    if (shutdown_initiated) {
-        std::cout << "\n[listener] Force exit...\n";
-        std::exit(1);
-    }
-    shutdown_initiated = true;
-
-    std::cout << "\n[listener] Received signal " << sig << ", shutting down...\n";
-    g_stop_requested = true;
-    MonitorManager::instance().stopAll();
-}
-
 static std::string nvmlErrorStr(nvmlReturn_t st) {
     const char* s = nvmlErrorString(st);
     return s ? std::string(s) : "Unknown NVML error";
@@ -48,7 +33,7 @@ bool NvmlDevice::getPowerMilliwatts(unsigned int& mw) const {
     return st == NVML_SUCCESS;
 }
 bool NvmlDevice::getUtilization(unsigned int& gpu, unsigned int& mem) const {
-    nvmlUtilization_t r{};
+    nvmlUtilizationRates_t r{};
     auto st = nvmlDeviceGetUtilizationRates(handle_, &r);
     if (st != NVML_SUCCESS) return false;
     gpu = r.gpu; mem = r.memory; return true;
@@ -84,10 +69,10 @@ NvmlDevice::getPerPidGpuPercent(unsigned long long last_seen_usec) const {
     // Fallback: just enumerate running processes, set 0%
     unsigned int count = 256;
     std::vector<nvmlProcessInfo_t> procs(count);
-    auto st1 = nvmlDeviceGetComputeRunningProcesses_v3(handle_, &count, procs.data());
+    auto st1 = nvmlDeviceGetComputeRunningProcesses_v2(handle_, &count, procs.data());
     if (st1 == NVML_ERROR_INSUFFICIENT_SIZE) {
         procs.resize(count);
-        st1 = nvmlDeviceGetComputeRunningProcesses_v3(handle_, &count, procs.data());
+        st1 = nvmlDeviceGetComputeRunningProcesses_v2(handle_, &count, procs.data());
     }
     if (st1 == NVML_SUCCESS) {
         for (unsigned i=0;i<count;i++) out[procs[i].pid] = 0;
@@ -422,13 +407,13 @@ void MonitorSession::write_chunk_logs(const NvmlSummary& s, const json& as_json,
 
 // -------------------- MonitorManager --------------------
 
-MonitorManager& gpu_listener::MonitorManager::instance() {
+MonitorManager& MonitorManager::instance() {
     static MonitorManager m;
     return m;
 }
 
 std::shared_ptr<MonitorSession>
-gpu_listener::MonitorManager::start(const std::string& chunk_id, unsigned gpu_index, std::optional<unsigned> pid_hint) {
+MonitorManager::start(const std::string& chunk_id, unsigned gpu_index, std::optional<unsigned> pid_hint) {
     std::lock_guard<std::mutex> lk(mu_);
     if (sessions_.count(chunk_id)) return nullptr;
     auto s = std::make_shared<MonitorSession>();
@@ -439,7 +424,7 @@ gpu_listener::MonitorManager::start(const std::string& chunk_id, unsigned gpu_in
     return s;
 }
 
-json gpu_listener::MonitorManager::end(const std::string& chunk_id) {
+json MonitorManager::end(const std::string& chunk_id) {
     std::shared_ptr<MonitorSession> s;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -454,7 +439,7 @@ json gpu_listener::MonitorManager::end(const std::string& chunk_id) {
     return j;
 }
 
-void gpu_listener::MonitorManager::stopAll() {
+void MonitorManager::stopAll() {
     std::lock_guard<std::mutex> lk(mu_);
     for (auto& kv : sessions_) kv.second->stopAndSummarize();
     sessions_.clear();
@@ -463,7 +448,8 @@ void gpu_listener::MonitorManager::stopAll() {
 // -------------------- WsSession / WsListener --------------------
 
 WsSession::WsSession(tcp::socket socket, unified_monitor::ChunkTracker* tracker)
-    : ws_(std::move(socket)), chunk_tracker_(tracker) {}
+    : ws_(std::move(socket))
+    , chunk_tracker_(tracker) {}
 
 void WsSession::run() {
     ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
@@ -544,29 +530,12 @@ void WsSession::handleMessage(const json& obj) {
     }
 
     if (status == 0) {
-        // Start monitoring and notify ChunkTracker
-        auto s = gpu_listener::MonitorManager::instance().start(cid, gpu_index, pid);
+        auto s = MonitorManager::instance().start(cid, gpu_index, pid);
         if (!s) { write(errorMsg("already_running","Monitoring already running for this chunk_id")); return; }
-
-        // Notify ChunkTracker if available
-        if (chunk_tracker_) {
-            std::string task_id = obj.value("task_id", "");
-            chunk_tracker_->onChunkArrival(cid, task_id);
-            chunk_tracker_->onChunkStart(cid);
-        }
-
         write(json{{"type","ack"},{"chunk_id",cid},{"status",0}});
     } else if (status == 1 || status == -1) {
-        // End monitoring and notify ChunkTracker
-        auto sum = gpu_listener::MonitorManager::instance().end(cid);
+        auto sum = MonitorManager::instance().end(cid);
         sum["type"] = (status==1 ? "summary" : "summary_error");
-
-        // Notify ChunkTracker if available
-        if (chunk_tracker_) {
-            std::string chunk_status = (status == 1) ? "completed" : "error";
-            chunk_tracker_->onChunkComplete(cid, chunk_status);
-        }
-
         write(sum);
     } else {
         write(errorMsg("bad_status","status must be 0|1|-1"));
@@ -593,7 +562,7 @@ void WsListener::doAccept() {
         beast::bind_front_handler(&WsListener::onAccept, shared_from_this()));
 }
 void WsListener::onAccept(beast::error_code ec, tcp::socket socket) {
-    if (!ec) std::make_shared<WsSession>(std::move(socket), chunk_tracker_)->run();
+    if (!ec) std::make_shared<WsSession>(std::move(socket))->run();
     else fail(ec, "accept");
     doAccept();
 }
@@ -617,12 +586,13 @@ int run_server(unsigned short port, const std::string& host) {
     auto srv = std::make_shared<WsListener>(ioc, ep);
     srv->run();
 
-    g_stop_requested = false;  // Reset the global flag
+    std::atomic<bool> stop{false};
+    auto onSignal = +[](int){};
 #if defined(_WIN32)
     // Windows: Ctrl+C is handled differently; relying on external stop is fine.
 #else
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
+    std::signal(SIGINT, [](int){ MonitorManager::instance().stopAll(); });
+    std::signal(SIGTERM, [](int){ MonitorManager::instance().stopAll(); });
 #endif
 
     std::thread t([&](){ ioc.run(); });
@@ -630,64 +600,251 @@ int run_server(unsigned short port, const std::string& host) {
     std::cout << "GPU listener on ws://" << host << ":" << port << "  (Ctrl+C to stop)\n";
 #if defined(_WIN32)
     // Busy-wait minimal loop; in real apps, hook proper console ctl handler
-    while (!g_stop_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    while (true) std::this_thread::sleep_for(std::chrono::milliseconds(200));
 #else
     // Sleep until process is terminated; stopAll called in signal handler
-    while (!g_stop_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    while (true) std::this_thread::sleep_for(std::chrono::milliseconds(200));
 #endif
 
-    std::cout << "[listener] Shutdown requested, cleaning up...\n";
-    gpu_listener::MonitorManager::instance().stopAll();
+    // (Not usually reached)
+    MonitorManager::instance().stopAll();
     ioc.stop();
     t.join();
     nvmlShutdown();
-    std::cout << "[listener] Cleanup complete, exiting.\n";
     return 0;
 }
 
-// -------------------- Enhanced server with ChunkTracker integration --------------------
 int run_server_with_tracker(unsigned short port, const std::string& host, unified_monitor::ChunkTracker* tracker) {
-    // NVML init early to report errors upfront
-    nvmlReturn_t st = nvmlInit_v2();
-    if (st != NVML_SUCCESS && st != NVML_ERROR_ALREADY_INITIALIZED) {
-        std::cerr << "NVML init failed at startup: " << gpu_listener::nvmlErrorStr(st) << "\n";
+    try {
+        auto const address = boost::asio::ip::make_address(host);
+        auto const endpoint = tcp::endpoint{address, port};
+
+        boost::asio::io_context ioc{1};
+        auto listener = std::make_shared<WsListener>(ioc, endpoint, tracker);
+        listener->run();
+
+        std::cout << "GPU listener on ws://" << host << ":" << port << "  (Ctrl+C to stop)\n";
+        ioc.run();
+    } catch (std::exception const& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
+    return 0;
+}
 
-    boost::asio::io_context ioc{1};
-    auto ep = boost::asio::ip::tcp::endpoint(boost::asio::ip::make_address(host), port);
-    auto srv = std::make_shared<gpu_listener::WsListener>(ioc, ep, tracker);
-    srv->run();
+// -------------------- SSL WebSocket Session --------------------
 
-    g_stop_requested = false;  // Reset the global flag
-#if defined(_WIN32)
-    // Windows: Ctrl+C is handled differently; relying on external stop is fine.
-#else
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
-#endif
+WssSession::WssSession(boost::asio::ssl::stream<tcp::socket> stream, unified_monitor::ChunkTracker* tracker)
+    : stream_(std::move(stream)), ws_(stream_), chunk_tracker_(tracker) {
+}
 
-    std::thread t([&](){ ioc.run(); });
+void WssSession::run() {
+    // Perform SSL handshake
+    stream_.async_handshake(boost::asio::ssl::stream_base::server,
+        beast::bind_front_handler(&WssSession::onHandshake, shared_from_this()));
+}
 
-    std::cout << "GPU listener on ws://" << host << ":" << port << " (Ctrl+C to stop)\n";
-    std::cout << "Integrated with ChunkTracker for metrics correlation\n";
+void WssSession::onHandshake(beast::error_code ec) {
+    if (ec) return fail(ec, "ssl_handshake");
 
-#if defined(_WIN32)
-    // Busy-wait minimal loop; in real apps, hook proper console ctl handler
-    while (!g_stop_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-#else
-    // Sleep until process is terminated; stopAll called in signal handler
-    while (!g_stop_requested.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
-#endif
+    // Accept the websocket handshake
+    ws_.async_accept(
+        beast::bind_front_handler(&WssSession::onAccept, shared_from_this()));
+}
 
-    std::cout << "[listener] Shutdown requested, cleaning up...\n";
-    gpu_listener::MonitorManager::instance().stopAll();
-    ioc.stop();
-    t.join();
-    nvmlShutdown();
-    std::cout << "[listener] Cleanup complete, exiting.\n";
+void WssSession::onAccept(beast::error_code ec) {
+    if (ec) return fail(ec, "accept");
+    doRead();
+}
+
+void WssSession::doRead() {
+    ws_.async_read(buffer_,
+        beast::bind_front_handler(&WssSession::onRead, shared_from_this()));
+}
+
+void WssSession::onRead(beast::error_code ec, std::size_t bytes_transferred) {
+    boost::ignore_unused(bytes_transferred);
+    if (ec) {
+        std::cerr << "[WssSession] DEBUG: Read error: " << ec.message() << std::endl;
+        return fail(ec, "read");
+    }
+
+    try {
+        auto data = beast::buffers_to_string(buffer_.data());
+        std::cout << "[WssSession] DEBUG: Received message: " << data << std::endl;
+        auto obj = json::parse(data);
+        std::cout << "[WssSession] DEBUG: Parsed JSON: " << obj.dump() << std::endl;
+        handleMessage(obj);
+        buffer_.consume(buffer_.size());
+    } catch (const std::exception& e) {
+        std::cerr << "[WssSession] DEBUG: JSON parse error: " << e.what() << std::endl;
+        buffer_.consume(buffer_.size());
+    }
+
+    doRead();
+}
+
+void WssSession::onWrite(beast::error_code ec, std::size_t) {
+    if (ec) return fail(ec, "write");
+}
+
+json WssSession::errorMsg(const std::string& code, const std::string& msg) {
+    return json{{"type", "error"}, {"code", code}, {"message", msg}};
+}
+
+void WssSession::handleMessage(const json& obj) {
+    try {
+        if (obj.contains("type") && obj["type"] == "chunk_status") {
+            if (chunk_tracker_ && obj.contains("chunk_id")) {
+                std::string chunk_id = obj["chunk_id"];
+                int status = obj.value("status", 0);
+
+                if (status == 0) {
+                    // Chunk arrival
+                    std::string task_id = obj.value("task_id", "");
+                    chunk_tracker_->onChunkArrival(chunk_id, task_id);
+                    std::cout << "[WssSession] Chunk arrival: " << chunk_id << "\n";
+                } else if (status == 1) {
+                    // Chunk completion
+                    chunk_tracker_->onChunkComplete(chunk_id, "completed");
+                    std::cout << "[WssSession] Chunk completion: " << chunk_id << "\n";
+                } else if (status == -1) {
+                    // Chunk error
+                    chunk_tracker_->onChunkComplete(chunk_id, "error");
+                    std::cout << "[WssSession] Chunk error: " << chunk_id << "\n";
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[WssSession] Message handling error: " << e.what() << "\n";
+    }
+}
+
+void WssSession::fail(beast::error_code ec, const char* what) {
+    if (ec == boost::asio::error::operation_aborted) return;
+    std::cerr << "[WssSession] " << what << ": " << ec.message() << "\n";
+}
+
+// -------------------- SSL WebSocket Listener --------------------
+
+WssListener::WssListener(boost::asio::io_context& ioc, boost::asio::ssl::context& ctx, tcp::endpoint ep, unified_monitor::ChunkTracker* tracker)
+    : ioc_(ioc), ctx_(ctx), acceptor_(ioc), chunk_tracker_(tracker) {
+    std::cout << "[WssListener] DEBUG: Constructor called for endpoint " << ep << std::endl;
+
+    beast::error_code ec;
+    std::cout << "[WssListener] DEBUG: Opening acceptor..." << std::endl;
+    acceptor_.open(ep.protocol(), ec);
+    if (ec) {
+        std::cerr << "[WssListener] DEBUG: Failed to open acceptor: " << ec.message() << std::endl;
+        fail(ec, "open");
+        return;
+    }
+    std::cout << "[WssListener] DEBUG: Acceptor opened successfully" << std::endl;
+
+    std::cout << "[WssListener] DEBUG: Setting reuse address option..." << std::endl;
+    acceptor_.set_option(boost::asio::socket_base::reuse_address(true), ec);
+    if (ec) {
+        std::cerr << "[WssListener] DEBUG: Failed to set reuse address: " << ec.message() << std::endl;
+        fail(ec, "set_option");
+        return;
+    }
+    std::cout << "[WssListener] DEBUG: Reuse address set successfully" << std::endl;
+
+    std::cout << "[WssListener] DEBUG: Binding to endpoint..." << std::endl;
+    acceptor_.bind(ep, ec);
+    if (ec) {
+        std::cerr << "[WssListener] DEBUG: Failed to bind: " << ec.message() << std::endl;
+        fail(ec, "bind");
+        return;
+    }
+    std::cout << "[WssListener] DEBUG: Bound successfully to " << ep << std::endl;
+
+    std::cout << "[WssListener] DEBUG: Starting to listen..." << std::endl;
+    acceptor_.listen(boost::asio::socket_base::max_listen_connections, ec);
+    if (ec) {
+        std::cerr << "[WssListener] DEBUG: Failed to listen: " << ec.message() << std::endl;
+        fail(ec, "listen");
+        return;
+    }
+    std::cout << "[WssListener] DEBUG: Listening successfully on " << ep << std::endl;
+}
+
+void WssListener::run() { doAccept(); }
+
+void WssListener::doAccept() {
+    acceptor_.async_accept(
+        boost::asio::make_strand(ioc_),
+        beast::bind_front_handler(&WssListener::onAccept, shared_from_this()));
+}
+
+void WssListener::onAccept(beast::error_code ec, tcp::socket socket) {
+    if (!ec) {
+        std::cout << "[WssListener] DEBUG: Accepted new connection, creating SSL stream" << std::endl;
+        try {
+            auto ssl_stream = boost::asio::ssl::stream<tcp::socket>(std::move(socket), ctx_);
+            std::cout << "[WssListener] DEBUG: SSL stream created, starting session" << std::endl;
+            std::make_shared<WssSession>(std::move(ssl_stream), chunk_tracker_)->run();
+        } catch (const std::exception& e) {
+            std::cerr << "[WssListener] DEBUG: Exception creating SSL stream: " << e.what() << std::endl;
+        }
+    } else {
+        std::cerr << "[WssListener] DEBUG: Accept failed with error: " << ec.message() << " (code: " << ec.value() << ")" << std::endl;
+        fail(ec, "accept");
+    }
+    doAccept();
+}
+
+void WssListener::fail(beast::error_code ec, const char* what) {
+    if (ec == boost::asio::error::operation_aborted) return;
+    std::cerr << "[WssListener] " << what << ": " << ec.message() << "\n";
+}
+
+// -------------------- SSL Server Runner --------------------
+
+int run_ssl_server_with_tracker(unsigned short port, const std::string& host, const std::string& cert_file, const std::string& key_file, unified_monitor::ChunkTracker* tracker) {
+    try {
+        std::cout << "[SSL Server] DEBUG: Starting SSL server on " << host << ":" << port << std::endl;
+        std::cout << "[SSL Server] DEBUG: Certificate file: " << cert_file << std::endl;
+        std::cout << "[SSL Server] DEBUG: Key file: " << key_file << std::endl;
+
+        auto const address = boost::asio::ip::make_address(host);
+        auto const endpoint = tcp::endpoint{address, port};
+        std::cout << "[SSL Server] DEBUG: Endpoint created: " << endpoint << std::endl;
+
+        boost::asio::io_context ioc{1};
+        std::cout << "[SSL Server] DEBUG: IO context created" << std::endl;
+
+        // Create SSL context
+        std::cout << "[SSL Server] DEBUG: Creating SSL context..." << std::endl;
+        boost::asio::ssl::context ctx{boost::asio::ssl::context::tlsv12};
+        std::cout << "[SSL Server] DEBUG: SSL context created, setting options..." << std::endl;
+
+        ctx.set_options(boost::asio::ssl::context::default_workarounds |
+                       boost::asio::ssl::context::no_sslv2 |
+                       boost::asio::ssl::context::single_dh_use);
+        std::cout << "[SSL Server] DEBUG: SSL options set" << std::endl;
+
+        std::cout << "[SSL Server] DEBUG: Loading certificate file..." << std::endl;
+        ctx.use_certificate_file(cert_file, boost::asio::ssl::context::file_format::pem);
+        std::cout << "[SSL Server] DEBUG: Certificate loaded" << std::endl;
+
+        std::cout << "[SSL Server] DEBUG: Loading private key file..." << std::endl;
+        ctx.use_private_key_file(key_file, boost::asio::ssl::context::file_format::pem);
+        std::cout << "[SSL Server] DEBUG: Private key loaded" << std::endl;
+
+        std::cout << "[SSL Server] DEBUG: Creating WssListener..." << std::endl;
+        auto listener = std::make_shared<WssListener>(ioc, ctx, endpoint, tracker);
+        std::cout << "[SSL Server] DEBUG: WssListener created, starting..." << std::endl;
+        listener->run();
+
+        std::cout << "SSL GPU listener on wss://" << host << ":" << port << "  (Ctrl+C to stop)\n";
+        std::cout << "[SSL Server] DEBUG: Starting IO context run..." << std::endl;
+        ioc.run();
+    } catch (std::exception const& e) {
+        std::cerr << "[SSL Server] ERROR: " << e.what() << std::endl;
+        return 1;
+    }
     return 0;
 }
 
 } // namespace gpu_listener
-

@@ -330,13 +330,14 @@ static ParsedUrl parse_url(const std::string& url) {
 }
 
 void UnifiedOrchestrator::setupDirectListener() {
-    // Start the direct WebSocket listener for chunk notifications
-    std::cout << "[Orchestrator] Starting direct WebSocket listener on port 8765\n";
-    std::cout << "[Orchestrator] Clients should connect to: ws://127.0.0.1:8765\n";
+    // Start the direct SSL WebSocket listener for chunk notifications
+    std::cout << "[Orchestrator] Starting direct SSL WebSocket listener on port 8765\n";
+    std::cout << "[Orchestrator] Clients should connect to: wss://127.0.0.1:8765\n";
 
     // The listener will be started in a separate thread with ChunkTracker integration
     listener_thread_ = std::thread([this]() {
-        gpu_listener::run_server_with_tracker(8765, "127.0.0.1", chunk_tracker_.get());
+        gpu_listener::run_ssl_server_with_tracker(8765, "127.0.0.1",
+            "/opt/mfc/bin/server.crt", "/opt/mfc/bin/server.key", chunk_tracker_.get());
     });
 }
 
