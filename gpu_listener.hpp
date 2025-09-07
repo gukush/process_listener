@@ -151,12 +151,13 @@ private:
 // WebSocket session & listener
 class WsSession : public std::enable_shared_from_this<WsSession> {
 public:
-    explicit WsSession(tcp::socket socket);
+    explicit WsSession(tcp::socket socket, unified_monitor::ChunkTracker* tracker = nullptr);
     void run();
 private:
     websocket::stream<tcp::socket> ws_;
     beast::flat_buffer buffer_;
     std::deque<std::string> send_queue_;
+    unified_monitor::ChunkTracker* chunk_tracker_;
 
     void onAccept(beast::error_code ec);
     void doRead();
@@ -172,11 +173,12 @@ private:
 
 class WsListener : public std::enable_shared_from_this<WsListener> {
 public:
-    WsListener(boost::asio::io_context& ioc, tcp::endpoint ep);
+    WsListener(boost::asio::io_context& ioc, tcp::endpoint ep, unified_monitor::ChunkTracker* tracker = nullptr);
     void run();
 private:
     boost::asio::io_context& ioc_;
     tcp::acceptor acceptor_;
+    unified_monitor::ChunkTracker* chunk_tracker_;
     void doAccept();
     void onAccept(beast::error_code ec, tcp::socket socket);
     static void fail(beast::error_code ec, const char* what);
@@ -184,5 +186,13 @@ private:
 
 // Entrypoint helper (optional)
 int run_server(unsigned short port = 8765, const std::string& host = "127.0.0.1");
+
+// Forward declaration for ChunkTracker
+namespace unified_monitor {
+    class ChunkTracker;
+}
+
+// Enhanced entrypoint that integrates with orchestrator
+int run_server_with_tracker(unsigned short port, const std::string& host, unified_monitor::ChunkTracker* tracker);
 
 } // namespace gpu_listener

@@ -1,4 +1,5 @@
 #include "gpu_listener.hpp"
+#include "orchestrator.hpp"
 
 #include <algorithm>
 #include <csignal>
@@ -445,8 +446,8 @@ void MonitorManager::stopAll() {
 
 // -------------------- WsSession / WsListener --------------------
 
-WsSession::WsSession(tcp::socket socket)
-    : ws_(std::move(socket)) {}
+WsSession::WsSession(tcp::socket socket, unified_monitor::ChunkTracker* tracker)
+    : ws_(std::move(socket)), chunk_tracker_(tracker) {}
 
 void WsSession::run() {
     ws_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
@@ -527,12 +528,29 @@ void WsSession::handleMessage(const json& obj) {
     }
 
     if (status == 0) {
+        // Start monitoring and notify ChunkTracker
         auto s = MonitorManager::instance().start(cid, gpu_index, pid);
         if (!s) { write(errorMsg("already_running","Monitoring already running for this chunk_id")); return; }
+
+        // Notify ChunkTracker if available
+        if (chunk_tracker_) {
+            std::string task_id = obj.value("task_id", "");
+            chunk_tracker_->onChunkArrival(cid, task_id);
+            chunk_tracker_->onChunkStart(cid);
+        }
+
         write(json{{"type","ack"},{"chunk_id",cid},{"status",0}});
     } else if (status == 1 || status == -1) {
+        // End monitoring and notify ChunkTracker
         auto sum = MonitorManager::instance().end(cid);
         sum["type"] = (status==1 ? "summary" : "summary_error");
+
+        // Notify ChunkTracker if available
+        if (chunk_tracker_) {
+            std::string chunk_status = (status == 1) ? "completed" : "error";
+            chunk_tracker_->onChunkComplete(cid, chunk_status);
+        }
+
         write(sum);
     } else {
         write(errorMsg("bad_status","status must be 0|1|-1"));
@@ -544,8 +562,8 @@ void WsSession::fail(beast::error_code ec, const char* what) {
     std::cerr << "[ws] " << what << ": " << ec.message() << "\n";
 }
 
-WsListener::WsListener(boost::asio::io_context& ioc, tcp::endpoint ep)
-    : ioc_(ioc), acceptor_(ioc) {
+WsListener::WsListener(boost::asio::io_context& ioc, tcp::endpoint ep, unified_monitor::ChunkTracker* tracker)
+    : ioc_(ioc), acceptor_(ioc), chunk_tracker_(tracker) {
     beast::error_code ec;
     acceptor_.open(ep.protocol(), ec); if (ec) return fail(ec, "open");
     acceptor_.set_option(boost::asio::socket_base::reuse_address(true), ec); if (ec) return fail(ec, "set_option");
@@ -559,7 +577,7 @@ void WsListener::doAccept() {
         beast::bind_front_handler(&WsListener::onAccept, shared_from_this()));
 }
 void WsListener::onAccept(beast::error_code ec, tcp::socket socket) {
-    if (!ec) std::make_shared<WsSession>(std::move(socket))->run();
+    if (!ec) std::make_shared<WsSession>(std::move(socket), chunk_tracker_)->run();
     else fail(ec, "accept");
     doAccept();
 }
@@ -612,6 +630,50 @@ int run_server(unsigned short port, const std::string& host) {
 }
 
 } // namespace gpu_listener
+
+// -------------------- Enhanced server with ChunkTracker integration --------------------
+int run_server_with_tracker(unsigned short port, const std::string& host, unified_monitor::ChunkTracker* tracker) {
+    // NVML init early to report errors upfront
+    nvmlReturn_t st = nvmlInit_v2();
+    if (st != NVML_SUCCESS && st != NVML_ERROR_ALREADY_INITIALIZED) {
+        std::cerr << "NVML init failed at startup: " << nvmlErrorStr(st) << "\n";
+        return 1;
+    }
+
+    boost::asio::io_context ioc{1};
+    auto ep = tcp::endpoint(boost::asio::ip::make_address(host), port);
+    auto srv = std::make_shared<WsListener>(ioc, ep, tracker);
+    srv->run();
+
+    std::atomic<bool> stop{false};
+    auto onSignal = +[](int){};
+#if defined(_WIN32)
+    // Windows: Ctrl+C is handled differently; relying on external stop is fine.
+#else
+    std::signal(SIGINT, [](int){ MonitorManager::instance().stopAll(); });
+    std::signal(SIGTERM, [](int){ MonitorManager::instance().stopAll(); });
+#endif
+
+    std::thread t([&](){ ioc.run(); });
+
+    std::cout << "GPU listener on ws://" << host << ":" << port << " (Ctrl+C to stop)\n";
+    std::cout << "Integrated with ChunkTracker for metrics correlation\n";
+
+#if defined(_WIN32)
+    // Busy-wait minimal loop; in real apps, hook proper console ctl handler
+    while (true) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+#else
+    // Sleep until process is terminated; stopAll called in signal handler
+    while (true) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+#endif
+
+    // (Not usually reached)
+    MonitorManager::instance().stopAll();
+    ioc.stop();
+    t.join();
+    nvmlShutdown();
+    return 0;
+}
 
 // -------------------- main --------------------
 int main(int argc, char** argv) {

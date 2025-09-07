@@ -67,7 +67,7 @@
 #endif
 
 #include "orchestrator.hpp"
-#include "websocket_proxy.hpp"
+#include "gpu_listener.hpp"
 
 using json = nlohmann::json;
 
@@ -142,32 +142,20 @@ static ChildProcess spawn_process(const SpawnSpec& spec) {
     return {pid};
 }
 
-// ---------------------- Interceptor: proxy -> tracker ------------------------
-class ProxyMessageInterceptor : public EnhancedMessageInterceptor {
+// ---------------------- Direct Message Handler ------------------------
+class DirectMessageHandler {
 public:
-    explicit ProxyMessageInterceptor(ChunkTracker* tracker) : tracker_(tracker) {}
-    void onTaskInit(const json& msg) override {
-        (void)msg; /* reserved for future task metadata */
+    explicit DirectMessageHandler(ChunkTracker* tracker) : tracker_(tracker) {}
+
+    void handleChunkArrival(const std::string& chunkId, const std::string& taskId) {
+        tracker_->onChunkArrival(chunkId, taskId);
+        tracker_->onChunkStart(chunkId);
     }
-    void onChunkAssign(const json& msg) override {
-        try {
-            std::string chunkId = msg.at("chunkId").get<std::string>();
-            std::string taskId  = msg.value("taskId", std::string{});
-            tracker_->onChunkArrival(chunkId, taskId);
-            tracker_->onChunkStart(chunkId);
-        } catch (const std::exception& e) {
-            std::cerr << "[Interceptor] onChunkAssign parse error: " << e.what() << "\n";
-        }
+
+    void handleChunkComplete(const std::string& chunkId, const std::string& status) {
+        tracker_->onChunkComplete(chunkId, status);
     }
-    void onChunkResult(const json& msg) override {
-        try {
-            std::string chunkId = msg.at("chunkId").get<std::string>();
-            std::string status  = msg.value("status", "completed");
-            tracker_->onChunkComplete(chunkId, status);
-        } catch (const std::exception& e) {
-            std::cerr << "[Interceptor] onChunkResult parse error: " << e.what() << "\n";
-        }
-    }
+
 private:
     ChunkTracker* tracker_;
 };
@@ -296,8 +284,7 @@ std::vector<GPUMetrics> GPUMetricsCollector::getMetrics() const {
 UnifiedOrchestrator::UnifiedOrchestrator()
     : os_collector_(std::make_unique<OSMetricsCollector>()),
       gpu_collector_(std::make_unique<GPUMetricsCollector>(0)),
-      chunk_tracker_(std::make_unique<ChunkTracker>()),
-      interceptor_(nullptr) {}
+      chunk_tracker_(std::make_unique<ChunkTracker>()) {}
 
 UnifiedOrchestrator::~UnifiedOrchestrator() { stop(); }
 
@@ -342,76 +329,36 @@ static ParsedUrl parse_url(const std::string& url) {
     return result;
 }
 
-void UnifiedOrchestrator::setupMessageProxy(const std::string& upstreamUrl) {
-    ParsedUrl parsed = parse_url(upstreamUrl);
+void UnifiedOrchestrator::setupDirectListener() {
+    // Start the direct WebSocket listener for chunk notifications
+    std::cout << "[Orchestrator] Starting direct WebSocket listener on port 8765\n";
+    std::cout << "[Orchestrator] Clients should connect to: ws://127.0.0.1:8765\n";
 
-    // Proxy 1: Browser Socket.IO (port 9797 -> remote_host:3000)
-    static std::unique_ptr<BeastWebSocketProxy> s_proxy_browser;
-    if (!s_proxy_browser) s_proxy_browser.reset(new BeastWebSocketProxy(chunk_tracker_.get(),
-                                                                        new ProxyMessageInterceptor(chunk_tracker_.get())));
-    bool ok1 = s_proxy_browser->start(9797, parsed.host, 3000, parsed.use_ssl);
-
-    // Proxy 2: Native WebSocket (port 9798 -> remote_host:3001)
-    static std::unique_ptr<BeastWebSocketProxy> s_proxy_native;
-    if (!s_proxy_native) s_proxy_native.reset(new BeastWebSocketProxy(chunk_tracker_.get(),
-                                                                      new ProxyMessageInterceptor(chunk_tracker_.get())));
-    bool ok2 = s_proxy_native->start(9798, parsed.host, 3001, parsed.use_ssl);
-
-    if (!ok1 || !ok2) std::cerr << "[Orchestrator] WS proxy start failed\n";
-    else {
-        std::cout << "[Orchestrator] Dual WS proxy started (9797->" << parsed.host << ":3000, 9798->" << parsed.host << ":3001, SSL=" << (parsed.use_ssl ? "yes" : "no") << ")\n";
-        std::cout << "[Orchestrator] Proxy URLs: Browser->http://127.0.0.1:9797, C++->ws://127.0.0.1:9798\n";
-    }
+    // The listener will be started in a separate thread with ChunkTracker integration
+    listener_thread_ = std::thread([this]() {
+        gpu_listener::run_server_with_tracker(8765, "127.0.0.1", chunk_tracker_.get());
+    });
 }
 
 bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
     running_ = true;
 
-    // 1) Proxy
-    setupMessageProxy(cfg.server_path);
+    // 1) Start direct listener
+    setupDirectListener();
 
     // 2) Spawn processes (use config overrides if provided)
     ChildProcess browser{-1}, cpp{-1};
     if (g_browser_spec && g_browser_spec->enabled) {
         browser = spawn_process(*g_browser_spec);
     } else {
-        // Fallback to previous behavior - use proxy URL for browser
+        // Use original server URL for browser
         SpawnSpec sp;
         std::string browser_url = cfg.browser_url;
-        // If using remote server, redirect browser to local proxy
-        if (cfg.server_path.find("://") != std::string::npos) {
-            browser_url = "http://127.0.0.1:9797";
-        }
-        sp.argv = {
-            cfg.browser_path,
-            "--new-window",
-            "--disable-logging",
-            "--disable-gpu-logging",
-            "--disable-gpu-sandbox",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-extensions",
-            "--disable-plugins",
-            "--disable-images",
-            "--disable-javascript",
-            "--disable-web-security",
-            "--ignore-certificate-errors",
-            "--ignore-ssl-errors",
-            "--ignore-certificate-errors-spki-list",
-            "--ignore-urlfetcher-cert-requests",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-features=TranslateUI",
-            "--disable-ipc-flooding-protection",
-            "--log-level=3",
-            "--silent",
-            browser_url
-        };
+        sp.argv = { cfg.browser_path, "--new-window", browser_url };
         browser = spawn_process(sp);
     }
     if (browser.pid > 0) {
-        std::cout << "[Spawn] Browser pid=" << browser.pid << " connecting to: " << browser_url << "\n";
+        std::cout << "[Spawn] Browser pid=" << browser.pid << " connecting to: " << cfg.browser_url << "\n";
         std::cout << "[Spawn] Browser command: ";
         for (const auto& arg : sp.argv) {
             std::cout << arg << " ";
@@ -425,14 +372,9 @@ bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
         cpp = spawn_process(*g_cpp_spec);
     } else {
         SpawnSpec sp;
-        // If using remote server, redirect C++ client to local proxy
-        if (cfg.server_path.find("://") != std::string::npos) {
-            sp.argv = { cfg.cpp_client_path, "--server", "ws://127.0.0.1:9798" };
-            std::cout << "[Spawn] C++ client connecting to proxy: ws://127.0.0.1:9798\n";
-        } else {
-            sp.argv = { cfg.cpp_client_path };
-            std::cout << "[Spawn] C++ client connecting directly to server\n";
-        }
+        // Use original server URL for C++ client
+        sp.argv = { cfg.cpp_client_path };
+        std::cout << "[Spawn] C++ client connecting directly to server\n";
         cpp = spawn_process(sp);
     }
     if (cpp.pid > 0) std::cout << "[Spawn] C++ client pid=" << cpp.pid << "\n";
@@ -476,6 +418,9 @@ bool UnifiedOrchestrator::runBrowserPlusCpp(const Config& cfg) {
 bool UnifiedOrchestrator::runCppOnly(const Config& cfg) {
     running_ = true;
 
+    // Start direct listener
+    setupDirectListener();
+
     ChildProcess cpp{-1};
     if (g_cpp_spec && g_cpp_spec->enabled) {
         cpp = spawn_process(*g_cpp_spec);
@@ -486,9 +431,6 @@ bool UnifiedOrchestrator::runCppOnly(const Config& cfg) {
     }
     if (cpp.pid > 0) std::cout << "[Spawn] C++ client pid=" << cpp.pid << "\n";
     else std::cerr << "[Spawn] C++ client failed (pid=" << cpp.pid << ")\n";
-    if (cfg.enable_proxy) {
-    setupMessageProxy(cfg.server_path);
-    }
     gpu_collector_.reset(new GPUMetricsCollector(cfg.gpu_index));
     os_collector_->startMonitoring(std::vector<pid_t>{ cpp.pid }, cfg.os_monitor_interval_ms);
 #if HAVE_CUDA
@@ -610,8 +552,6 @@ static bool load_config(const std::string& path, UnifiedOrchestrator::Config& cf
     if (j.contains("duration_sec")) cfg_out.duration_sec = j["duration_sec"].get<int>();
     if (j.contains("output_dir")) cfg_out.output_dir = j["output_dir"].get<std::string>();
     if (j.contains("export_detailed_samples")) cfg_out.export_detailed_samples = j["export_detailed_samples"].get<bool>();
-    if (j.contains("enable_proxy")) cfg_out.enable_proxy = j["enable_proxy"].get<bool>();
-    if (j.contains("proxy_listen_port")) cfg_out.proxy_listen_port = j["proxy_listen_port"].get<uint16_t>();
     auto parse_proc = [](const json& jp) -> SpawnSpec {
         SpawnSpec sp;
         if (jp.contains("enabled")) sp.enabled = jp["enabled"].get<bool>();

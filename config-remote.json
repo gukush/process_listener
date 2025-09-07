@@ -6,7 +6,7 @@
   "browser": {
     "enabled": true,
     "argv": ["/usr/bin/google-chrome", "--new-window", "http://127.0.0.1:9797"],
-    "cwd": "/",
+    "cwd": "/tmp",
     "env": { "DISPLAY": ":0" },
     "shell": false
   },
@@ -14,7 +14,7 @@
   "cpp_client": {
     "enabled": true,
     "argv": ["./cpp_client", "--server", "ws://127.0.0.1:9798"],
-    "cwd": "/home/user/project",
+    "cwd": "/tmp",
     "env": { },
     "shell": false
   },

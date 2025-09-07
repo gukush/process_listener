@@ -46,3 +46,4 @@ fi
 
 echo "Test completed. If all tests pass, you can use:"
 echo "  ./unified_monitor --mode browser+cpp --server ws://$REMOTE_HOST:3001"
+

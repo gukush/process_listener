@@ -201,8 +201,6 @@ struct CommandSpec {
 };
 
 // --------- Orchestrator ---------
-class EnhancedMessageInterceptor; // interface (defined in websocket_proxy.hpp)
-class BeastWebSocketProxy;        // fwd
 
 class UnifiedOrchestrator {
 public:
@@ -214,8 +212,6 @@ public:
         std::string browser_path = "/usr/bin/google-chrome";
         std::string browser_url  = "http://localhost:3000";
         std::string cpp_client_path = "./cpp_client";
-        bool enable_proxy = true;
-        uint16_t proxy_listen_port = 9797;
         // New: exact commands via config
         CommandSpec browser; // used in mode=browser+cpp
         CommandSpec cpp;     // used in both modes
@@ -239,7 +235,7 @@ public:
     void stop();
 
 private:
-    void setupMessageProxy(const std::string& upstreamUrl);
+    void setupDirectListener();
     void exportMetrics(const Config& cfg);
 
 private:
@@ -247,8 +243,8 @@ private:
     std::unique_ptr<GPUMetricsCollector> gpu_collector_;
     std::unique_ptr<ChunkTracker>        chunk_tracker_;
 
-    EnhancedMessageInterceptor* interceptor_;
     std::atomic<bool> running_{false};
+    std::thread listener_thread_;
 };
 
 } // namespace unified_monitor
