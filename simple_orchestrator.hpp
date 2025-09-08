@@ -105,7 +105,10 @@ class SimpleOrchestrator {
 public:
     struct Config {
         // Process names to scan for (no more spawning)
-        std::vector<std::string> target_process_names = {"google-chrome", "native_client"};
+        std::vector<std::string> target_process_names = {"chrome", "native_client"};
+
+        // Chrome data directory filtering
+        std::string chrome_data_dir = "";  // If specified, only monitor Chrome processes with this --user-data-dir
 
         // Sampling
         unsigned gpu_index = 0;
@@ -129,7 +132,10 @@ public:
 private:
     // Process scanning
     std::vector<pid_t> scanForProcesses(const std::vector<std::string>& process_names);
+    std::vector<pid_t> scanForProcesses(const std::vector<std::string>& process_names, const std::string& chrome_data_dir);
     std::vector<pid_t> getPidsByName(const std::string& process_name);
+    std::string getProcessCmdline(pid_t pid);
+    bool hasChromeDataDir(pid_t pid, const std::string& data_dir);
 
     // Metrics collection - Fix: change signature to match implementation
     void startMetricsCollection(const Config& cfg);

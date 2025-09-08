@@ -74,6 +74,34 @@ static std::atomic<bool> g_interrupted = false;
 static void handle_signal(int) { g_interrupted = true; }
 
 // --------------------------- process scanning -----------------------------------
+std::string SimpleOrchestrator::getProcessCmdline(pid_t pid) {
+    std::string cmdline;
+    std::ifstream cmdline_file("/proc/" + std::to_string(pid) + "/cmdline");
+    if (cmdline_file.is_open()) {
+        std::getline(cmdline_file, cmdline);
+        // Replace null bytes with spaces for easier parsing
+        std::replace(cmdline.begin(), cmdline.end(), '\0', ' ');
+        // Remove trailing whitespace
+        cmdline.erase(cmdline.find_last_not_of(" \t\n\r\f\v") + 1);
+    }
+    return cmdline;
+}
+
+bool SimpleOrchestrator::hasChromeDataDir(pid_t pid, const std::string& data_dir) {
+    if (data_dir.empty()) {
+        return true; // No filtering if data_dir not specified
+    }
+
+    std::string cmdline = getProcessCmdline(pid);
+    if (cmdline.empty()) {
+        return false;
+    }
+
+    // Look for --user-data-dir argument in the command line
+    std::string search_pattern = "--user-data-dir=" + data_dir;
+    return cmdline.find(search_pattern) != std::string::npos;
+}
+
 std::vector<pid_t> SimpleOrchestrator::getPidsByName(const std::string& process_name) {
     std::vector<pid_t> pids;
 
@@ -130,6 +158,41 @@ std::vector<pid_t> SimpleOrchestrator::scanForProcesses(const std::vector<std::s
     if (all_pids.empty()) {
         std::cout << "[Scan] No target processes found. Make sure "
                   << "google-chrome and/or native_client are running." << std::endl;
+    } else {
+        std::cout << "[Scan] Found " << all_pids.size() << " target processes to monitor" << std::endl;
+    }
+
+    return all_pids;
+}
+
+std::vector<pid_t> SimpleOrchestrator::scanForProcesses(const std::vector<std::string>& process_names, const std::string& chrome_data_dir) {
+    std::vector<pid_t> all_pids;
+
+    for (const auto& name : process_names) {
+        auto pids = getPidsByName(name);
+
+        // Apply Chrome data directory filtering if specified
+        if (name == "chrome" && !chrome_data_dir.empty()) {
+            std::vector<pid_t> filtered_pids;
+            for (pid_t pid : pids) {
+                if (hasChromeDataDir(pid, chrome_data_dir)) {
+                    filtered_pids.push_back(pid);
+                    std::string cmdline = getProcessCmdline(pid);
+                    std::cout << "[Scan] Chrome PID " << pid << " matches data dir filter: " << cmdline << std::endl;
+                }
+            }
+            pids = filtered_pids;
+        }
+
+        all_pids.insert(all_pids.end(), pids.begin(), pids.end());
+    }
+
+    if (all_pids.empty()) {
+        std::cout << "[Scan] No target processes found. Make sure "
+                  << "google-chrome and/or native_client are running." << std::endl;
+        if (!chrome_data_dir.empty()) {
+            std::cout << "[Scan] Chrome data directory filter: " << chrome_data_dir << std::endl;
+        }
     } else {
         std::cout << "[Scan] Found " << all_pids.size() << " target processes to monitor" << std::endl;
     }
@@ -283,7 +346,7 @@ bool SimpleOrchestrator::run(const Config& cfg) {
     }
 
     // Scan for target processes
-    monitored_pids_ = scanForProcesses(cfg.target_process_names);
+    monitored_pids_ = scanForProcesses(cfg.target_process_names, cfg.chrome_data_dir);
 
     if (monitored_pids_.empty()) {
         std::cerr << "[Orchestrator] No target processes found to monitor" << std::endl;
@@ -378,9 +441,14 @@ static void print_usage(const char* argv0) {
     "  " << argv0 << " [--gpu-index N] [--os-interval MS] [--gpu-interval MS]\n"
     "               [--duration SEC] [--out-dir DIR]\n"
     "               [--process-names NAME1,NAME2,...]\n"
+    "               [--data-dir DIR]\n"
     "\n"
-    "This tool scans for running processes named 'google-chrome' and 'native_client'\n"
-    "by default and monitors their OS and GPU metrics.\n";
+    "This tool scans for running processes named 'chrome' and 'native_client'\n"
+    "by default and monitors their OS and GPU metrics.\n"
+    "\n"
+    "Options:\n"
+    "  --data-dir DIR    Filter Chrome processes by --user-data-dir argument\n"
+    "                    Only monitor Chrome processes that use this data directory\n";
 }
 
 // Helper function to split comma-separated string
@@ -431,6 +499,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--process-names") {
             cfg.target_process_names = split_string(need("--process-names"), ',');
+        }
+        else if (a == "--data-dir") {
+            cfg.chrome_data_dir = need("--data-dir");
         }
         else if (a == "--help" || a == "-h") {
             print_usage(argv[0]);
