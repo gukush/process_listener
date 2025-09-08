@@ -73,63 +73,68 @@ namespace unified_monitor {
 static std::atomic<bool> g_interrupted = false;
 static void handle_signal(int) { g_interrupted = true; }
 
-// --------------------------- process spawn -----------------------------------
-SimpleOrchestrator::ChildProcess SimpleOrchestrator::spawnProcess(const CommandSpec& spec, const std::string& name) {
-    if (!spec.enabled) return {-1, name};
+// --------------------------- process scanning -----------------------------------
+std::vector<pid_t> SimpleOrchestrator::getPidsByName(const std::string& process_name) {
+    std::vector<pid_t> pids;
 
-    // Build cargv for execvp OR for /bin/sh -lc
-    std::vector<std::string> local_argv;
-    if (spec.shell) {
-        // Join argv as a single string command
-        std::string joined;
-        for (size_t i = 0; i < spec.argv.size(); ++i) {
-            if (i) joined += ' ';
-            joined += spec.argv[i];
-        }
-        local_argv = { "/bin/sh", "-lc", joined };
-    } else {
-        local_argv = spec.argv;
-        if (local_argv.empty()) {
-            std::cerr << "[Spawn] Empty argv for " << name << "; nothing to exec\n";
-            return {-1, name};
-        }
+    // Read /proc directory to find processes
+    std::filesystem::path proc_path("/proc");
+    if (!std::filesystem::exists(proc_path)) {
+        std::cerr << "[Scan] /proc directory not found" << std::endl;
+        return pids;
     }
 
-    std::vector<char*> cargv;
-    cargv.reserve(local_argv.size() + 1);
-    for (auto& s : local_argv) cargv.push_back(const_cast<char*>(s.c_str()));
-    cargv.push_back(nullptr);
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator(proc_path)) {
+            if (!entry.is_directory()) continue;
 
-    pid_t pid = fork();
-    if (pid == -1) {
-        perror("fork");
-        return {-1, name};
-    }
-    if (pid == 0) {
-        // Child: set CWD and ENV if requested
-        if (!spec.cwd.empty()) {
-            if (chdir(spec.cwd.c_str()) != 0) {
-                perror("chdir");
-                _exit(127);
+            std::string dir_name = entry.path().filename().string();
+
+            // Check if directory name is a number (PID)
+            if (std::all_of(dir_name.begin(), dir_name.end(), ::isdigit)) {
+                pid_t pid = static_cast<pid_t>(std::stoi(dir_name));
+
+                // Read process name from /proc/PID/comm
+                std::ifstream comm_file(entry.path() / "comm");
+                if (comm_file.is_open()) {
+                    std::string comm;
+                    if (std::getline(comm_file, comm)) {
+                        // Remove trailing newline if present
+                        if (!comm.empty() && comm.back() == '\n') {
+                            comm.pop_back();
+                        }
+
+                        if (comm == process_name) {
+                            pids.push_back(pid);
+                            std::cout << "[Scan] Found " << process_name << " with PID " << pid << std::endl;
+                        }
+                    }
+                }
             }
         }
-        for (const auto& kv : spec.env) {
-            ::setenv(kv.first.c_str(), kv.second.c_str(), 1);
-        }
-        // Exec
-        execvp(cargv[0], cargv.data());
-        perror("execvp");
-        _exit(127);
+    } catch (const std::exception& e) {
+        std::cerr << "[Scan] Error scanning processes: " << e.what() << std::endl;
     }
-    return {pid, name};
+
+    return pids;
 }
 
-void SimpleOrchestrator::terminateProcess(ChildProcess& proc) {
-    if (proc.pid > 0) {
-        std::cout << "[Spawn] Terminating " << proc.name << " (pid=" << proc.pid << ")" << std::endl;
-        kill(proc.pid, SIGTERM);
-        proc.pid = -1;
+std::vector<pid_t> SimpleOrchestrator::scanForProcesses(const std::vector<std::string>& process_names) {
+    std::vector<pid_t> all_pids;
+
+    for (const auto& name : process_names) {
+        auto pids = getPidsByName(name);
+        all_pids.insert(all_pids.end(), pids.begin(), pids.end());
     }
+
+    if (all_pids.empty()) {
+        std::cout << "[Scan] No target processes found. Make sure "
+                  << "google-chrome and/or native_client are running." << std::endl;
+    } else {
+        std::cout << "[Scan] Found " << all_pids.size() << " target processes to monitor" << std::endl;
+    }
+
+    return all_pids;
 }
 
 // --------- OSMetricsCollector thread orchestration ----------
@@ -184,10 +189,11 @@ static std::string nvml_err_str(nvmlReturn_t st) {
 GPUMetricsCollector::GPUMetricsCollector(unsigned gpu_index) : gpu_index_(gpu_index) {}
 GPUMetricsCollector::~GPUMetricsCollector() { stopMonitoring(); }
 
-void GPUMetricsCollector::startMonitoring(unsigned interval_ms) {
+void GPUMetricsCollector::startMonitoring(unsigned interval_ms, const std::vector<pid_t>& monitored_pids) {
 #if HAVE_CUDA
     stopMonitoring();
     interval_ms_ = interval_ms ? interval_ms : 50;
+    monitored_pids_ = monitored_pids;
     running_ = true;
     worker_ = std::thread([this]() {
         nvmlReturn_t st = nvmlInit_v2();
@@ -217,6 +223,7 @@ void GPUMetricsCollector::startMonitoring(unsigned interval_ms) {
             unsigned int sm = 0;
             if (nvmlDeviceGetClockInfo(dev, NVML_CLOCK_SM, &sm) == NVML_SUCCESS) m.sm_clock_mhz = sm;
 
+            // Get per-process GPU utilization
             const unsigned int MAX_SAMPLES = 1024;
             std::vector<nvmlProcessUtilizationSample_t> samples(MAX_SAMPLES);
             unsigned int n = MAX_SAMPLES;
@@ -224,7 +231,13 @@ void GPUMetricsCollector::startMonitoring(unsigned interval_ms) {
             if (st == NVML_SUCCESS) {
                 for (unsigned int i = 0; i < n; ++i) {
                     const auto& s = samples[i];
-                    m.pid_gpu_percent[static_cast<unsigned int>(s.pid)] = s.smUtil;
+                    pid_t pid = static_cast<pid_t>(s.pid);
+
+                    // Only track PIDs we're monitoring (if any specified)
+                    if (monitored_pids_.empty() ||
+                        std::find(monitored_pids_.begin(), monitored_pids_.end(), pid) != monitored_pids_.end()) {
+                        m.pid_gpu_percent[static_cast<unsigned int>(s.pid)] = s.smUtil;
+                    }
                 }
             }
 
@@ -260,7 +273,7 @@ SimpleOrchestrator::SimpleOrchestrator()
 
 SimpleOrchestrator::~SimpleOrchestrator() { stop(); }
 
-bool SimpleOrchestrator::runBrowserPlusCpp(const Config& cfg) {
+bool SimpleOrchestrator::run(const Config& cfg) {
     running_ = true;
 
     // Initialize storage
@@ -269,31 +282,11 @@ bool SimpleOrchestrator::runBrowserPlusCpp(const Config& cfg) {
         return false;
     }
 
-    // Spawn processes
-    spawned_processes_.clear();
+    // Scan for target processes
+    monitored_pids_ = scanForProcesses(cfg.target_process_names);
 
-    if (cfg.browser.enabled) {
-        auto browser = spawnProcess(cfg.browser, "browser");
-        if (browser.pid > 0) {
-            spawned_processes_.push_back(browser);
-            std::cout << "[Spawn] Browser pid=" << browser.pid << std::endl;
-        } else {
-            std::cerr << "[Spawn] Browser failed to start" << std::endl;
-        }
-    }
-
-    if (cfg.cpp.enabled) {
-        auto cpp = spawnProcess(cfg.cpp, "cpp_client");
-        if (cpp.pid > 0) {
-            spawned_processes_.push_back(cpp);
-            std::cout << "[Spawn] C++ client pid=" << cpp.pid << std::endl;
-        } else {
-            std::cerr << "[Spawn] C++ client failed to start" << std::endl;
-        }
-    }
-
-    if (spawned_processes_.empty()) {
-        std::cerr << "[Orchestrator] No processes spawned successfully" << std::endl;
+    if (monitored_pids_.empty()) {
+        std::cerr << "[Orchestrator] No target processes found to monitor" << std::endl;
         return false;
     }
 
@@ -314,60 +307,6 @@ bool SimpleOrchestrator::runBrowserPlusCpp(const Config& cfg) {
     // Stop collectors and export
     stopMetricsCollection();
     exportSummary(cfg);
-
-    // Terminate processes
-    for (auto& proc : spawned_processes_) {
-        terminateProcess(proc);
-    }
-
-    return true;
-}
-
-bool SimpleOrchestrator::runCppOnly(const Config& cfg) {
-    running_ = true;
-
-    // Initialize storage
-    if (!storage_->initialize()) {
-        std::cerr << "[Orchestrator] Failed to initialize storage" << std::endl;
-        return false;
-    }
-
-    // Spawn C++ client only
-    spawned_processes_.clear();
-
-    if (cfg.cpp.enabled) {
-        auto cpp = spawnProcess(cfg.cpp, "cpp_client");
-        if (cpp.pid > 0) {
-            spawned_processes_.push_back(cpp);
-            std::cout << "[Spawn] C++ client pid=" << cpp.pid << std::endl;
-        } else {
-            std::cerr << "[Spawn] C++ client failed to start" << std::endl;
-            return false;
-        }
-    }
-
-    // Start metrics collection
-    startMetricsCollection(cfg);
-
-    // Wait loop
-    auto t0 = Clock::now();
-    while (running_) {
-        if (g_interrupted) break;
-        if (cfg.duration_sec > 0 && Clock::now() - t0 > std::chrono::seconds(cfg.duration_sec)) break;
-
-        // Periodically flush metrics to storage
-        flushMetrics();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    }
-
-    // Stop collectors and export
-    stopMetricsCollection();
-    exportSummary(cfg);
-
-    // Terminate processes
-    for (auto& proc : spawned_processes_) {
-        terminateProcess(proc);
-    }
 
     return true;
 }
@@ -377,19 +316,13 @@ void SimpleOrchestrator::stop() {
 }
 
 void SimpleOrchestrator::startMetricsCollection(const Config& cfg) {
-    // Collect PIDs for OS monitoring
-    std::vector<pid_t> pids;
-    for (const auto& proc : spawned_processes_) {
-        if (proc.pid > 0) pids.push_back(proc.pid);
-    }
+    // Start OS metrics collection with scanned PIDs
+    os_collector_->startMonitoring(monitored_pids_, cfg.os_monitor_interval_ms);
 
-    // Start OS metrics collection
-    os_collector_->startMonitoring(pids, cfg.os_monitor_interval_ms);
-
-    // Start GPU metrics collection
+    // Start GPU metrics collection with monitored PIDs for per-process filtering
     gpu_collector_.reset(new GPUMetricsCollector(cfg.gpu_index));
 #if HAVE_CUDA
-    gpu_collector_->startMonitoring(cfg.gpu_monitor_interval_ms);
+    gpu_collector_->startMonitoring(cfg.gpu_monitor_interval_ms, monitored_pids_);
 #else
     std::cout << "[GPU] HAVE_CUDA=0 -> GPU/NVML metrics disabled." << std::endl;
 #endif
@@ -442,71 +375,25 @@ void SimpleOrchestrator::exportSummary(const Config& config) {
 static void print_usage(const char* argv0) {
     std::cerr <<
     "Usage:\n"
-    "  " << argv0 << " [--config FILE.json]\n"
-    "               [--mode browser+cpp|cpp-only]\n"
-    "               [--server ws://HOST:PORT]\n"
-    "               [--browser-path PATH] [--browser-url URL]\n"
-    "               [--cpp-client PATH]\n"
-    "               [--gpu-index N] [--os-interval MS] [--gpu-interval MS]\n"
-    "               [--duration SEC] [--out-dir DIR]\n";
+    "  " << argv0 << " [--gpu-index N] [--os-interval MS] [--gpu-interval MS]\n"
+    "               [--duration SEC] [--out-dir DIR]\n"
+    "               [--process-names NAME1,NAME2,...]\n"
+    "\n"
+    "This tool scans for running processes named 'google-chrome' and 'native_client'\n"
+    "by default and monitors their OS and GPU metrics.\n";
 }
 
-static bool load_config(const std::string& path, SimpleOrchestrator::Config& cfg_out) {
-    std::ifstream f(path);
-    if (!f) {
-        std::cerr << "[Config] Cannot open: " << path << "\n";
-        return false;
-    }
-    json j; f >> j;
-
-    if (j.contains("server")) cfg_out.server_path = j["server"].get<std::string>();
-    if (j.contains("gpu_index")) cfg_out.gpu_index = j["gpu_index"].get<unsigned>();
-    if (j.contains("os_interval_ms"))  cfg_out.os_monitor_interval_ms  = j["os_interval_ms"].get<unsigned>();
-    if (j.contains("gpu_interval_ms")) cfg_out.gpu_monitor_interval_ms = j["gpu_interval_ms"].get<unsigned>();
-    if (j.contains("duration_sec")) cfg_out.duration_sec = j["duration_sec"].get<int>();
-    if (j.contains("output_dir")) cfg_out.output_dir = j["output_dir"].get<std::string>();
-
-    auto parse_proc = [](const json& jp) -> CommandSpec {
-        CommandSpec sp;
-        if (jp.contains("enabled")) sp.enabled = jp["enabled"].get<bool>();
-        if (jp.contains("cwd")) sp.cwd = jp["cwd"].get<std::string>();
-        if (jp.contains("shell")) sp.shell = jp["shell"].get<bool>();
-        if (jp.contains("argv") && jp["argv"].is_array()) {
-            for (const auto& a : jp["argv"]) sp.argv.push_back(a.get<std::string>());
-        }
-        if (jp.contains("env") && jp["env"].is_object()) {
-            for (auto it = jp["env"].begin(); it != jp["env"].end(); ++it) {
-                sp.env[it.key()] = it.value().get<std::string>();
-            }
-        }
-        return sp;
-    };
-
-    if (j.contains("browser") && j["browser"].is_object()) {
-        cfg_out.browser = parse_proc(j["browser"]);
-    }
-    if (j.contains("cpp_client") && j["cpp_client"].is_object()) {
-        cfg_out.cpp = parse_proc(j["cpp_client"]);
-    }
-
-    // Storage configuration
-    if (j.contains("storage") && j["storage"].is_object()) {
-        const auto& storage = j["storage"];
-        if (storage.contains("max_rows_per_file")) {
-            cfg_out.storage_config.max_rows_per_file = storage["max_rows_per_file"].get<size_t>();
-        }
-        if (storage.contains("max_file_age_minutes")) {
-            cfg_out.storage_config.max_file_age = std::chrono::minutes(storage["max_file_age_minutes"].get<int>());
-        }
-        if (storage.contains("use_zstd_compression")) {
-            cfg_out.storage_config.use_zstd_compression = storage["use_zstd_compression"].get<bool>();
-        }
-        if (storage.contains("zstd_compression_level")) {
-            cfg_out.storage_config.zstd_compression_level = storage["zstd_compression_level"].get<int>();
+// Helper function to split comma-separated string
+static std::vector<std::string> split_string(const std::string& str, char delimiter) {
+    std::vector<std::string> result;
+    std::stringstream ss(str);
+    std::string item;
+    while (std::getline(ss, item, delimiter)) {
+        if (!item.empty()) {
+            result.push_back(item);
         }
     }
-
-    return true;
+    return result;
 }
 
 } // namespace unified_monitor
@@ -518,10 +405,6 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, handle_signal);
 
     SimpleOrchestrator::Config cfg;
-    std::string mode = "browser+cpp";
-    cfg.server_path = "ws://127.0.0.1:8765";
-
-    std::optional<std::string> config_path;
 
     // -------------------------- CLI parse --------------------------
     for (int i = 1; i < argc; ++i) {
@@ -530,54 +413,38 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc) { std::cerr << name << " requires value\n"; print_usage(argv[0]); std::exit(2); }
             return std::string(argv[++i]);
         };
-        if (a == "--config") config_path = need("--config");
-        else if (a == "--mode") mode = need("--mode");
-        else if (a == "--server") cfg.server_path = need("--server");
-        else if (a == "--browser-path") {
-            cfg.browser.argv = {need("--browser-path")};
-            cfg.browser.enabled = true;
-        }
-        else if (a == "--browser-url") {
-            if (cfg.browser.argv.empty()) cfg.browser.argv = {"/usr/bin/google-chrome"};
-            cfg.browser.argv.push_back("--new-window");
-            cfg.browser.argv.push_back(need("--browser-url"));
-            cfg.browser.enabled = true;
-        }
-        else if (a == "--cpp-client") {
-            cfg.cpp.argv = {need("--cpp-client")};
-            cfg.cpp.enabled = true;
-        }
-        else if (a == "--gpu-index") cfg.gpu_index = static_cast<unsigned>(std::stoul(need("--gpu-index")));
-        else if (a == "--os-interval") cfg.os_monitor_interval_ms = static_cast<unsigned>(std::stoul(need("--os-interval")));
-        else if (a == "--gpu-interval") cfg.gpu_monitor_interval_ms = static_cast<unsigned>(std::stoul(need("--gpu-interval")));
-        else if (a == "--duration") cfg.duration_sec = std::stoi(need("--duration"));
-        else if (a == "--out-dir") cfg.output_dir = need("--out-dir");
-        else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
-        else { std::cerr << "Unknown arg: " << a << "\n"; print_usage(argv[0]); return 2; }
-    }
 
-    // -------------------------- Load config (optional) --------------------------
-    if (config_path) {
-        if (!load_config(*config_path, cfg)) {
-            return 2;
+        if (a == "--gpu-index") {
+            cfg.gpu_index = static_cast<unsigned>(std::stoul(need("--gpu-index")));
         }
-        // If config specifies mode, override CLI/default
-        std::ifstream cf(*config_path);
-        if (cf.good()) {
-            json j; cf >> j;
-            if (j.contains("mode") && j["mode"].is_string()) {
-                mode = j["mode"].get<std::string>();
-            }
+        else if (a == "--os-interval") {
+            cfg.os_monitor_interval_ms = static_cast<unsigned>(std::stoul(need("--os-interval")));
+        }
+        else if (a == "--gpu-interval") {
+            cfg.gpu_monitor_interval_ms = static_cast<unsigned>(std::stoul(need("--gpu-interval")));
+        }
+        else if (a == "--duration") {
+            cfg.duration_sec = std::stoi(need("--duration"));
+        }
+        else if (a == "--out-dir") {
+            cfg.output_dir = need("--out-dir");
+        }
+        else if (a == "--process-names") {
+            cfg.target_process_names = split_string(need("--process-names"), ',');
+        }
+        else if (a == "--help" || a == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        }
+        else {
+            std::cerr << "Unknown arg: " << a << "\n";
+            print_usage(argv[0]);
+            return 2;
         }
     }
 
     SimpleOrchestrator orch;
-
-    bool ok = false;
-    if (mode == "browser+cpp") ok = orch.runBrowserPlusCpp(cfg);
-    else if (mode == "cpp-only") ok = orch.runCppOnly(cfg);
-    else { std::cerr << "Invalid --mode\n"; return 2; }
-
+    bool ok = orch.run(cfg);
     orch.stop();
     return ok ? 0 : 1;
 }

@@ -75,13 +75,14 @@ public:
     explicit GPUMetricsCollector(unsigned gpu_index);
     ~GPUMetricsCollector();
 
-    void startMonitoring(unsigned interval_ms);
+    void startMonitoring(unsigned interval_ms, const std::vector<pid_t>& monitored_pids = {});
     void stopMonitoring();
     std::vector<GPUMetrics> getMetrics() const;
 
 private:
     unsigned gpu_index_ = 0;
     unsigned interval_ms_ = 50;
+    std::vector<pid_t> monitored_pids_;
     std::atomic<bool> running_{false};
     mutable std::mutex mx_;
     std::thread worker_;
@@ -103,12 +104,8 @@ struct CommandSpec {
 class SimpleOrchestrator {
 public:
     struct Config {
-        // Connection
-        std::string server_path = "ws://127.0.0.1:8765";
-
-        // Process specifications
-        CommandSpec browser; // used in mode=browser+cpp
-        CommandSpec cpp;     // used in both modes
+        // Process names to scan for (no more spawning)
+        std::vector<std::string> target_process_names = {"google-chrome", "native_client"};
 
         // Sampling
         unsigned gpu_index = 0;
@@ -126,19 +123,13 @@ public:
     SimpleOrchestrator();
     ~SimpleOrchestrator();
 
-    bool runBrowserPlusCpp(const Config& cfg);
-    bool runCppOnly(const Config& cfg);
+    bool run(const Config& cfg);
     void stop();
 
 private:
-    // Process management
-    struct ChildProcess {
-        pid_t pid = -1;
-        std::string name;
-    };
-
-    ChildProcess spawnProcess(const CommandSpec& spec, const std::string& name);
-    void terminateProcess(ChildProcess& proc);
+    // Process scanning
+    std::vector<pid_t> scanForProcesses(const std::vector<std::string>& process_names);
+    std::vector<pid_t> getPidsByName(const std::string& process_name);
 
     // Metrics collection - Fix: change signature to match implementation
     void startMetricsCollection(const Config& cfg);
@@ -154,7 +145,7 @@ private:
     std::unique_ptr<MetricsStorage>      storage_;
 
     std::atomic<bool> running_{false};
-    std::vector<ChildProcess> spawned_processes_;
+    std::vector<pid_t> monitored_pids_;
 };
 
 } // namespace unified_monitor
