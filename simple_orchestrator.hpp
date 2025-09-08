@@ -140,8 +140,8 @@ private:
     ChildProcess spawnProcess(const CommandSpec& spec, const std::string& name);
     void terminateProcess(ChildProcess& proc);
 
-    // Metrics collection
-    void startMetricsCollection(const std::vector<pid_t>& pids, const Config& cfg);
+    // Metrics collection - Fix: change signature to match implementation
+    void startMetricsCollection(const Config& cfg);
     void stopMetricsCollection();
     void flushMetrics();
 
@@ -158,4 +158,3 @@ private:
 };
 
 } // namespace unified_monitor
-

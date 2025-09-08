@@ -245,22 +245,40 @@ void MetricsStorage::closeFile(FileWriter& writer) {
 
 std::unique_ptr<orc::Type> MetricsStorage::createOSSchema() {
     try {
-        return orc::createStructType()
-            ->addField("timestamp", orc::createPrimitiveType(orc::DOUBLE))
-            ->addField("pid", orc::createPrimitiveType(orc::INT))
-            ->addField("cpu_percent", orc::createPrimitiveType(orc::FLOAT))
-            ->addField("mem_rss_kb", orc::createPrimitiveType(orc::LONG))
-            ->addField("mem_vms_kb", orc::createPrimitiveType(orc::LONG))
-            ->addField("disk_read_bytes", orc::createPrimitiveType(orc::LONG))
-            ->addField("disk_write_bytes", orc::createPrimitiveType(orc::LONG))
-            ->addField("net_recv_bytes", orc::createPrimitiveType(orc::LONG))
-            ->addField("net_sent_bytes", orc::createPrimitiveType(orc::LONG));
+        // Use the correct ORC API to build schema from string
+        return std::unique_ptr<orc::Type>(
+            orc::Type::buildTypeFromString(
+                "struct<timestamp:double,pid:int,cpu_percent:float,mem_rss_kb:bigint,"
+                "mem_vms_kb:bigint,disk_read_bytes:bigint,disk_write_bytes:bigint,"
+                "net_recv_bytes:bigint,net_sent_bytes:bigint>"
+            )
+        );
     } catch (const std::exception& e) {
         std::cerr << "[MetricsStorage] Failed to create OS schema: " << e.what() << std::endl;
         return nullptr;
     }
 }
 
+std::unique_ptr<orc::Type> MetricsStorage::createGPUSchema() {
+#if HAVE_CUDA
+    try {
+        // Use the correct ORC API to build schema from string
+        return std::unique_ptr<orc::Type>(
+            orc::Type::buildTypeFromString(
+                "struct<timestamp:double,gpu_index:int,power_mw:int,"
+                "gpu_util_percent:int,mem_util_percent:int,mem_used_bytes:bigint,"
+                "sm_clock_mhz:int>"
+            )
+        );
+    } catch (const std::exception& e) {
+        std::cerr << "[MetricsStorage] Failed to create GPU schema: " << e.what() << std::endl;
+        return nullptr;
+    }
+#else
+    return nullptr; // GPU metrics disabled
+#endif
+}
+/*
 std::unique_ptr<orc::Type> MetricsStorage::createGPUSchema() {
 #if HAVE_CUDA
     try {
@@ -280,7 +298,7 @@ std::unique_ptr<orc::Type> MetricsStorage::createGPUSchema() {
     return nullptr; // GPU metrics disabled
 #endif
 }
-
+*/
 void MetricsStorage::writeOSBatch(orc::Writer* writer, const std::vector<OSMetrics>& metrics) {
     if (metrics.empty()) return;
 

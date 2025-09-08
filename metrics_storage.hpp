@@ -27,7 +27,9 @@ public:
         int zstd_compression_level = 3; // Good balance of speed vs compression
     };
 
-    explicit MetricsStorage(const Config& config = Config{});
+    // Fix: Use default constructor approach instead of default parameter with Config{}
+    explicit MetricsStorage(const Config& config);
+    MetricsStorage(); // Default constructor that uses default Config
     ~MetricsStorage();
 
     // Initialize storage and create output directory
@@ -88,14 +90,14 @@ private:
 private:
     Config config_;
 
-    // OS metrics storage
-    std::mutex os_mutex_;
+    // OS metrics storage - Fix: make mutexes mutable for const methods
+    mutable std::mutex os_mutex_;
     std::unique_ptr<FileWriter> os_writer_;
     std::vector<OSMetrics> os_buffer_;
     StorageStats stats_;
 
     // GPU metrics storage
-    std::mutex gpu_mutex_;
+    mutable std::mutex gpu_mutex_;
     std::unique_ptr<FileWriter> gpu_writer_;
     std::vector<GPUMetrics> gpu_buffer_;
 };
