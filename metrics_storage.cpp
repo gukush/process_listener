@@ -12,6 +12,10 @@ MetricsStorage::MetricsStorage(const Config& config) : config_(config) {
     gpu_buffer_.reserve(1000);
 }
 
+
+MetricsStorage::MetricsStorage()
+    : MetricsStorage(Config{}) {}
+
 MetricsStorage::~MetricsStorage() {
     flush();
 }
