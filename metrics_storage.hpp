@@ -3,7 +3,6 @@
 #include <orc/OrcFile.hh>
 #include <orc/Reader.hh>
 #include <orc/Writer.hh>
-#include <orc/OutputStream.hh>
 #include <memory>
 #include <string>
 #include <vector>
