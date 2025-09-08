@@ -1,9 +1,5 @@
 #include "metrics_storage.hpp"
 #include "orchestrator.hpp"
-#include <arrow/builder.h>
-#include <arrow/type.h>
-#include <arrow/array.h>
-#include <arrow/table.h>
 #include <filesystem>
 #include <iostream>
 #include <iomanip>
@@ -81,8 +77,8 @@ void MetricsStorage::createOSFile() {
     }
 
     auto filename = generateFilename("os_metrics");
-    auto output = std::make_unique<arrow::io::FileOutputStream>(filename);
-    if (!output->Open().ok()) {
+    auto output = orc::writeLocalFile(filename);
+    if (!output) {
         std::cerr << "[MetricsStorage] Failed to create OS file: " << filename << std::endl;
         return;
     }
@@ -148,8 +144,8 @@ void MetricsStorage::createGPUFile() {
     }
 
     auto filename = generateFilename("gpu_metrics");
-    auto output = std::make_unique<arrow::io::FileOutputStream>(filename);
-    if (!output->Open().ok()) {
+    auto output = orc::writeLocalFile(filename);
+    if (!output) {
         std::cerr << "[MetricsStorage] Failed to create GPU file: " << filename << std::endl;
         return;
     }
@@ -243,7 +239,6 @@ void MetricsStorage::closeFile(FileWriter& writer) {
         writer.writer.reset();
     }
     if (writer.output) {
-        writer.output->Close();
         writer.output.reset();
     }
 }

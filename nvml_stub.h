@@ -26,3 +26,4 @@ inline nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t, nvmlProcessUti
 inline const char* nvmlErrorString(nvmlReturn_t) { return "NVML disabled"; }
 
 #endif // NVML_STUB_H
+

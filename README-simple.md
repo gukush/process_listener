@@ -1,13 +1,13 @@
 # Simplified Listener/Orchestrator
 
-This is a simplified version of the listener that focuses on process spawning and efficient metrics collection using Apache Arrow/ORC with Zstd compression.
+This is a simplified version of the listener that focuses on process spawning and efficient metrics collection using Apache ORC with Zstd compression.
 
 ## Key Changes from Original
 
 - **Removed WebSocket handling**: No more chunk tracking or message interception
 - **Removed `?listener` argument**: Browser clients no longer need special listener mode
 - **Simplified metrics collection**: Just collects OS and GPU metrics continuously
-- **Efficient storage**: Uses Apache Arrow/ORC with Zstd compression for optimal storage
+- **Efficient storage**: Uses Apache ORC with Zstd compression for optimal storage
 - **File rolling**: Automatically rolls files by time (5 min) or size (100k rows)
 
 ## Features
@@ -21,7 +21,7 @@ This is a simplified version of the listener that focuses on process spawning an
 
 ## Dependencies
 
-- Apache Arrow C++
+- Apache ORC C++
 - Apache ORC C++
 - nlohmann/json
 - NVML (for GPU metrics, optional)
@@ -30,13 +30,13 @@ This is a simplified version of the listener that focuses on process spawning an
 
 ```bash
 # Install dependencies (Ubuntu/Debian)
-sudo apt-get install libarrow-dev liborc-dev libnlohmann-json-dev
+sudo apt-get install liborc-dev libnlohmann-json-dev
 
 # For GPU support (optional)
 sudo apt-get install nvidia-ml-dev  # or install CUDA toolkit
 
 # Or use vcpkg
-vcpkg install arrow orc nlohmann-json
+vcpkg install orc nlohmann-json
 
 # Build with GPU support (default)
 mkdir build && cd build
@@ -151,7 +151,6 @@ duckdb -c "COPY (SELECT * FROM read_orc('os_metrics_*.orc')) TO 'os_metrics.csv'
 duckdb -c "COPY (SELECT * FROM read_orc('gpu_metrics_*.orc')) TO 'gpu_metrics.csv' WITH (HEADER, DELIMITER ',');"
 
 # Using Python with pyarrow
-import pyarrow as pa
 import pyarrow.orc as orc
 import pandas as pd
 import glob
@@ -180,7 +179,7 @@ gpu_df.to_csv('gpu_metrics.csv', index=False)
 ## Troubleshooting
 
 1. **NVML not found**: Build with `-DHAVE_CUDA=OFF` to disable GPU metrics
-2. **Arrow/ORC not found**: Install via package manager or vcpkg
+2. **ORC not found**: Install via package manager or vcpkg
 3. **Permission issues**: Ensure write access to output directory
 4. **Process spawn failures**: Check paths and environment variables in config
 5. **CUDA compilation errors**: Use `-DHAVE_CUDA=OFF` if you don't need GPU metrics

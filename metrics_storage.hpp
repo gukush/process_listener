@@ -1,10 +1,9 @@
 #pragma once
 
-#include <arrow/api.h>
-#include <arrow/io/api.h>
 #include <orc/OrcFile.hh>
 #include <orc/Reader.hh>
 #include <orc/Writer.hh>
+#include <orc/OutputStream.hh>
 #include <memory>
 #include <string>
 #include <vector>
@@ -18,7 +17,7 @@ namespace unified_monitor {
 struct OSMetrics;
 struct GPUMetrics;
 
-// Efficient metrics storage using Apache Arrow/Parquet with Zstd compression
+// Efficient metrics storage using Apache ORC with Zstd compression
 class MetricsStorage {
 public:
     struct Config {
@@ -57,7 +56,7 @@ private:
     // Internal file management
     struct FileWriter {
         std::unique_ptr<orc::Writer> writer;
-        std::unique_ptr<arrow::io::FileOutputStream> output;
+        std::unique_ptr<orc::OutputStream> output;
         std::string filename;
         size_t row_count = 0;
         std::chrono::steady_clock::time_point created_at;

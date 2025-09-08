@@ -77,3 +77,4 @@ echo "Summary:"
 echo "- CUDA-enabled build: Creates both OS and GPU metrics files"
 echo "- CUDA-disabled build: Creates only OS metrics files"
 echo "- Both builds should work without errors"
+

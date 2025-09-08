@@ -3,7 +3,7 @@
 # Test script for simplified listener
 set -e
 
-echo "Testing simplified listener with Apache Arrow/Parquet storage..."
+echo "Testing simplified listener with Apache ORC storage..."
 
 # Build the project
 echo "Building..."

@@ -1,4 +1,4 @@
-// simple_main.cpp - Simplified orchestrator with Apache Arrow/Parquet storage
+// simple_main.cpp - Simplified orchestrator with Apache ORC storage
 // Removes WebSocket handling and chunk tracking, focuses on process spawning and metrics collection
 //
 // Example config (config.json):
@@ -582,3 +582,4 @@ int main(int argc, char** argv) {
     orch.stop();
     return ok ? 0 : 1;
 }
+
