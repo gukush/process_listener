@@ -34,7 +34,7 @@ if(NOT OpenSSL_FOUND)
 endif()
 
 # Apache ORC: prefer CONFIG (vcpkg), otherwise system package
-find_package(ORC CONFIG QUIET)
+find_package(orc CONFIG QUIET)
 if(NOT ORC_FOUND)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(ORC REQUIRED orc)
@@ -61,7 +61,7 @@ target_include_directories(unified_monitor
 if(ORC_FOUND)
     if(TARGET ORC::ORC)
         # Modern CMake target
-        target_link_libraries(unified_monitor PRIVATE ORC::ORC)
+        target_link_libraries(unified_monitor PRIVATE orc::orc)
     else()
         # Fallback for pkg-config
         target_include_directories(unified_monitor PRIVATE ${ORC_INCLUDE_DIRS})
