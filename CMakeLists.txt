@@ -35,7 +35,7 @@ endif()
 
 # Apache ORC: prefer CONFIG (vcpkg), otherwise system package
 find_package(orc CONFIG QUIET)
-if(NOT ORC_FOUND)
+if(NOT orc_FOUND)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(ORC REQUIRED orc)
 endif()
@@ -56,7 +56,7 @@ target_include_directories(unified_monitor
 )
 
 # Add ORC include directories
-if(ORC_FOUND)
+if(orc_FOUND)
     if(TARGET orc::orc)
         # Modern CMake target
         target_link_libraries(unified_monitor PRIVATE orc::orc)
