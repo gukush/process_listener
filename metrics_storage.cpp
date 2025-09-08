@@ -17,7 +17,7 @@ MetricsStorage::MetricsStorage()
     : MetricsStorage(Config{}) {}
 
 MetricsStorage::~MetricsStorage() {
-    flush();
+    flushAndClose(); // Use flushAndClose instead of flush
 }
 
 bool MetricsStorage::initialize() {
@@ -69,6 +69,44 @@ void MetricsStorage::flush() {
 #endif
 }
 
+void MetricsStorage::flushAndClose() {
+    std::lock_guard<std::mutex> os_lock(os_mutex_);
+    std::lock_guard<std::mutex> gpu_lock(gpu_mutex_);
+
+    // Flush any remaining data
+    flushOSData();
+#if HAVE_CUDA
+    flushGPUData();
+#endif
+
+    // Close and finalize all open files
+    if (os_writer_) {
+        try {
+            std::cout << "[MetricsStorage] Closing OS file: " << os_writer_->filename
+                      << " (" << os_writer_->row_count << " rows)" << std::endl;
+            closeFile(*os_writer_);
+            stats_.os_files_written++;
+        } catch (const std::exception& e) {
+            std::cerr << "[MetricsStorage] Error closing OS file: " << e.what() << std::endl;
+        }
+        os_writer_.reset();
+    }
+
+#if HAVE_CUDA
+    if (gpu_writer_) {
+        try {
+            std::cout << "[MetricsStorage] Closing GPU file: " << gpu_writer_->filename
+                      << " (" << gpu_writer_->row_count << " rows)" << std::endl;
+            closeFile(*gpu_writer_);
+            stats_.gpu_files_written++;
+        } catch (const std::exception& e) {
+            std::cerr << "[MetricsStorage] Error closing GPU file: " << e.what() << std::endl;
+        }
+        gpu_writer_.reset();
+    }
+#endif
+}
+
 MetricsStorage::StorageStats MetricsStorage::getStats() const {
     std::lock_guard<std::mutex> os_lock(os_mutex_);
     std::lock_guard<std::mutex> gpu_lock(gpu_mutex_);
@@ -78,6 +116,7 @@ MetricsStorage::StorageStats MetricsStorage::getStats() const {
 void MetricsStorage::createOSFile() {
     if (os_writer_) {
         closeFile(*os_writer_);
+        stats_.os_files_written++;
     }
 
     auto filename = generateFilename("os_metrics");
@@ -145,6 +184,7 @@ void MetricsStorage::createGPUFile() {
 #if HAVE_CUDA
     if (gpu_writer_) {
         closeFile(*gpu_writer_);
+        stats_.gpu_files_written++;
     }
 
     auto filename = generateFilename("gpu_metrics");
@@ -239,7 +279,12 @@ bool MetricsStorage::shouldRollFile(const FileWriter& writer) const {
 
 void MetricsStorage::closeFile(FileWriter& writer) {
     if (writer.writer) {
-        writer.writer->close();
+        try {
+            // Ensure any pending writes are completed before closing
+            writer.writer->close();
+        } catch (const std::exception& e) {
+            std::cerr << "[MetricsStorage] Error during writer close: " << e.what() << std::endl;
+        }
         writer.writer.reset();
     }
     if (writer.output) {
@@ -282,27 +327,7 @@ std::unique_ptr<orc::Type> MetricsStorage::createGPUSchema() {
     return nullptr; // GPU metrics disabled
 #endif
 }
-/*
-std::unique_ptr<orc::Type> MetricsStorage::createGPUSchema() {
-#if HAVE_CUDA
-    try {
-        return orc::createStructType()
-            ->addField("timestamp", orc::createPrimitiveType(orc::DOUBLE))
-            ->addField("gpu_index", orc::createPrimitiveType(orc::INT))
-            ->addField("power_mw", orc::createPrimitiveType(orc::INT))
-            ->addField("gpu_util_percent", orc::createPrimitiveType(orc::INT))
-            ->addField("mem_util_percent", orc::createPrimitiveType(orc::INT))
-            ->addField("mem_used_bytes", orc::createPrimitiveType(orc::LONG))
-            ->addField("sm_clock_mhz", orc::createPrimitiveType(orc::INT));
-    } catch (const std::exception& e) {
-        std::cerr << "[MetricsStorage] Failed to create GPU schema: " << e.what() << std::endl;
-        return nullptr;
-    }
-#else
-    return nullptr; // GPU metrics disabled
-#endif
-}
-*/
+
 void MetricsStorage::writeOSBatch(orc::Writer* writer, const std::vector<OSMetrics>& metrics) {
     if (metrics.empty()) return;
 

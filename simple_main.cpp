@@ -71,7 +71,10 @@ namespace unified_monitor {
 
 // --------------------------- signals -----------------------------------------
 static std::atomic<bool> g_interrupted = false;
-static void handle_signal(int) { g_interrupted = true; }
+static void handle_signal(int) {
+    g_interrupted = true;
+    std::cout << "\n[Signal] Interrupt received, shutting down gracefully..." << std::endl;
+}
 
 // --------------------------- process scanning -----------------------------------
 std::string SimpleOrchestrator::getProcessCmdline(pid_t pid) {
@@ -415,9 +418,14 @@ void SimpleOrchestrator::flushMetrics() {
 }
 
 void SimpleOrchestrator::exportSummary(const Config& config) {
-    // Flush any remaining metrics
+    std::cout << "[Orchestrator] Finalizing metrics storage..." << std::endl;
+
+    // Flush any remaining metrics first
     flushMetrics();
-    storage_->flush();
+
+    // CRITICAL FIX: Use flushAndClose() instead of flush()
+    // to ensure ORC files are properly closed with footer/metadata
+    storage_->flushAndClose();
 
     // Print summary
     auto stats = storage_->getStats();
@@ -432,6 +440,7 @@ void SimpleOrchestrator::exportSummary(const Config& config) {
     if (!stats.last_gpu_file.empty()) {
         std::cout << "Last GPU file: " << stats.last_gpu_file << std::endl;
     }
+    std::cout << "[Orchestrator] Shutdown complete." << std::endl;
 }
 
 // ----------------------------------- CLI & Config ----------------------------

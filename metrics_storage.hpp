@@ -42,6 +42,9 @@ public:
     // Force flush current data to disk
     void flush();
 
+    // Force flush and close all files (for clean shutdown)
+    void flushAndClose();
+
     // Get statistics about stored data
     struct StorageStats {
         size_t total_os_samples = 0;
