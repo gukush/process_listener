@@ -8,8 +8,8 @@
 namespace unified_monitor {
 
 MetricsStorage::MetricsStorage(const Config& config) : config_(config) {
-    os_buffer_.reserve(1000);  // Pre-allocate buffer
-    gpu_buffer_.reserve(1000);
+    os_buffer_.reserve(10000);  // Pre-allocate buffer
+    gpu_buffer_.reserve(10000);
 }
 
 
@@ -38,7 +38,7 @@ void MetricsStorage::addOSMetrics(const std::vector<OSMetrics>& metrics) {
     os_buffer_.insert(os_buffer_.end(), metrics.begin(), metrics.end());
 
     // Flush if buffer is getting large
-    if (os_buffer_.size() >= 1000) {
+    if (os_buffer_.size() >= 10000) {
         flushOSData();
     }
 }
@@ -51,7 +51,7 @@ void MetricsStorage::addGPUMetrics(const std::vector<GPUMetrics>& metrics) {
     gpu_buffer_.insert(gpu_buffer_.end(), metrics.begin(), metrics.end());
 
     // Flush if buffer is getting large
-    if (gpu_buffer_.size() >= 1000) {
+    if (gpu_buffer_.size() >= 10000) {
         flushGPUData();
     }
 #else

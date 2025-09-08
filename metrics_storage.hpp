@@ -21,7 +21,7 @@ class MetricsStorage {
 public:
     struct Config {
         std::string output_dir = "./metrics";
-        size_t max_rows_per_file = 100000;  // Roll files every ~100k rows
+        size_t max_rows_per_file = 1000000;  // Roll files every ~100k rows
         std::chrono::minutes max_file_age{5}; // Roll files every 5 minutes
         bool use_zstd_compression = true;
         int zstd_compression_level = 3; // Good balance of speed vs compression
