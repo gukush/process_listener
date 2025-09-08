@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.15)
 project(unified_monitor LANGUAGES CXX)
 
+# Simplified Listener with Apache ORC storage
+#
+# Build options:
+#   -DHAVE_CUDA=ON   : Enable GPU metrics collection via NVML (default)
+#   -DHAVE_CUDA=OFF  : Disable GPU metrics, only collect OS metrics
+#
+# Examples:
+#   cmake -DHAVE_CUDA=ON  -DCMAKE_BUILD_TYPE=Release  # With GPU support
+#   cmake -DHAVE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release  # OS metrics only
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -14,12 +24,7 @@ if(DEFINED CMAKE_TOOLCHAIN_FILE AND CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg")
 endif()
 
 # Dependencies
-# Boost: only 'system' is required (we use std::thread)
-if(USING_VCPKG)
-    find_package(Boost CONFIG REQUIRED COMPONENTS system)
-else()
-    find_package(Boost REQUIRED COMPONENTS system)
-endif()
+# Boost not needed for simplified version
 
 # nlohmann_json: prefer CONFIG (vcpkg), otherwise system package
 find_package(nlohmann_json CONFIG QUIET)
@@ -27,35 +32,39 @@ if(NOT nlohmann_json_FOUND)
     find_package(nlohmann_json REQUIRED)
 endif()
 
-# OpenSSL: prefer CONFIG (vcpkg), otherwise system package
-find_package(OpenSSL CONFIG QUIET)
-if(NOT OpenSSL_FOUND)
-    find_package(OpenSSL REQUIRED)
+# OpenSSL not needed for simplified version
+
+# Apache Arrow: prefer CONFIG (vcpkg), otherwise system package
+find_package(arrow CONFIG QUIET)
+if(NOT arrow_FOUND)
+    find_package(Arrow REQUIRED)
 endif()
 
-# Sources (note: we DO NOT compile orchestrator.cpp; we use orchestrator.hpp)
+# Apache ORC: prefer CONFIG (vcpkg), otherwise system package
+find_package(orc CONFIG QUIET)
+if(NOT orc_FOUND)
+    find_package(ORC REQUIRED)
+endif()
+
+# Sources for simplified versionst
 set(SRCS
-    main.cpp
-    csv_export.cpp
-    aggregation_export.cpp
+    simple_main.cpp
     os_metrics_linux.cpp
-    gpu_listener.cpp
+    metrics_storage.cpp
 )
 
 add_executable(unified_monitor ${SRCS})
 
 target_include_directories(unified_monitor
     PRIVATE
-        ${Boost_INCLUDE_DIRS}
-        ${CMAKE_CURRENT_SOURCE_DIR}  # for orchestrator.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}  # for simple_orchestrator.hpp
 )
 
 target_link_libraries(unified_monitor
     PRIVATE
-        Boost::system
         nlohmann_json::nlohmann_json
-        OpenSSL::SSL
-        OpenSSL::Crypto
+        arrow::arrow
+        orc::orc
         pthread
 )
 
@@ -90,40 +99,8 @@ if(HAVE_CUDA)
     target_compile_definitions(unified_monitor PRIVATE HAVE_CUDA=1)
 else()
     target_compile_definitions(unified_monitor PRIVATE HAVE_CUDA=0)
-    # Create a stub nvml.h for compilation when CUDA is disabled
-    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/nvml_stub.h
-"#ifndef NVML_STUB_H
-#define NVML_STUB_H
-
-// Stub NVML definitions for when CUDA is disabled
-typedef int nvmlReturn_t;
-typedef void* nvmlDevice_t;
-typedef struct { unsigned int gpu; unsigned int memory; } nvmlUtilization_t;
-typedef struct { unsigned int gpu; unsigned int memory; } nvmlUtilizationRates_t;
-typedef struct { unsigned long long used; } nvmlMemory_t;
-typedef struct { unsigned int pid; unsigned int smUtil; } nvmlProcessUtilizationSample_t;
-typedef struct { unsigned int pid; } nvmlProcessInfo_t;
-
-#define NVML_SUCCESS 0
-#define NVML_ERROR_ALREADY_INITIALIZED 1
-#define NVML_ERROR_INSUFFICIENT_SIZE 2
-#define NVML_CLOCK_SM 0
-
-inline nvmlReturn_t nvmlInit_v2() { return NVML_SUCCESS; }
-inline nvmlReturn_t nvmlShutdown() { return NVML_SUCCESS; }
-inline nvmlReturn_t nvmlDeviceGetHandleByIndex_v2(unsigned int, nvmlDevice_t*) { return NVML_SUCCESS; }
-inline nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t, unsigned int*) { return NVML_SUCCESS; }
-inline nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t, nvmlUtilizationRates_t*) { return NVML_SUCCESS; }
-inline nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t, nvmlMemory_t*) { return NVML_SUCCESS; }
-inline nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t, int, unsigned int*) { return NVML_SUCCESS; }
-inline nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t, nvmlProcessUtilizationSample_t*, unsigned int*, unsigned long long) { return NVML_SUCCESS; }
-inline nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(nvmlDevice_t, unsigned int*, nvmlProcessInfo_t*) { return NVML_SUCCESS; }
-inline nvmlReturn_t nvmlDeviceGetGraphicsRunningProcesses_v3(nvmlDevice_t, unsigned int*, nvmlProcessInfo_t*) { return NVML_SUCCESS; }
-inline const char* nvmlErrorString(nvmlReturn_t) { return \"NVML disabled\"; }
-
-#endif
-")
-    target_include_directories(unified_monitor PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    # Use the permanent NVML stub file when CUDA is disabled
+    target_include_directories(unified_monitor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # Build:

@@ -1,0 +1,32 @@
+{
+  "mode": "browser+cpp",
+  "server": "ws://127.0.0.1:8765",
+
+  "browser": {
+    "enabled": true,
+    "argv": ["/usr/bin/google-chrome", "--new-window", "http://localhost:3000"],
+    "cwd": "/",
+    "env": { "DISPLAY": ":0" },
+    "shell": false
+  },
+
+  "cpp_client": {
+    "enabled": true,
+    "argv": ["./cpp_client"],
+    "cwd": "/home/user/project",
+    "env": { },
+    "shell": false
+  },
+
+  "gpu_index": 0,
+  "os_interval_ms": 100,
+  "gpu_interval_ms": 50,
+  "duration_sec": 0,
+  "output_dir": "./metrics",
+  "storage": {
+    "max_rows_per_file": 100000,
+    "max_file_age_minutes": 5,
+    "use_zstd_compression": true,
+    "zstd_compression_level": 3
+  }
+}
