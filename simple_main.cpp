@@ -64,7 +64,6 @@
 #endif
 
 #include "simple_orchestrator.hpp"
-#include "os_metrics_linux.cpp"
 
 using json = nlohmann::json;
 
@@ -582,4 +581,3 @@ int main(int argc, char** argv) {
     orch.stop();
     return ok ? 0 : 1;
 }
-
