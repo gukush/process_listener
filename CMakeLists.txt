@@ -40,13 +40,11 @@ if(NOT ORC_FOUND)
     pkg_check_modules(ORC REQUIRED orc)
 endif()
 
-# Sources (note: we DO NOT compile orchestrator.cpp; we use orchestrator.hpp)
+# Sources (note: we DO NOT compile orchestrator.cpp; we use simple_orchestrator.hpp)
 set(SRCS
-    main.cpp
-    csv_export.cpp
-    aggregation_export.cpp
+    simple_main.cpp
+    metrics_storage.cpp
     os_metrics_linux.cpp
-    gpu_listener.cpp
 )
 
 add_executable(unified_monitor ${SRCS})
@@ -54,12 +52,12 @@ add_executable(unified_monitor ${SRCS})
 target_include_directories(unified_monitor
     PRIVATE
         ${Boost_INCLUDE_DIRS}
-        ${CMAKE_CURRENT_SOURCE_DIR}  # for orchestrator.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}  # for simple_orchestrator.hpp
 )
 
 # Add ORC include directories
 if(ORC_FOUND)
-    if(TARGET ORC::ORC)
+    if(TARGET orc::orc)
         # Modern CMake target
         target_link_libraries(unified_monitor PRIVATE orc::orc)
     else()
