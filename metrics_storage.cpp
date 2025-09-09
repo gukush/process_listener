@@ -20,6 +20,10 @@ MetricsStorage::~MetricsStorage() {
     flushAndClose(); // Use flushAndClose instead of flush
 }
 
+void MetricsStorage::setStorageConfig(const Config& config) {
+    config_ = config;
+}
+
 bool MetricsStorage::initialize() {
     try {
         std::filesystem::create_directories(config_.output_dir);

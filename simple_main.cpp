@@ -339,8 +339,17 @@ SimpleOrchestrator::SimpleOrchestrator()
 
 SimpleOrchestrator::~SimpleOrchestrator() { stop(); }
 
+void SimpleOrchestrator::setStorageConfig(const MetricsStorage::Config& config) {
+    storage_->setStorageConfig(config);
+}
+
 bool SimpleOrchestrator::run(const Config& cfg) {
     running_ = true;
+
+    // Configure storage with the provided config
+    MetricsStorage::Config storage_config = cfg.storage_config;
+    storage_config.output_dir = cfg.output_dir;  // Use the output_dir from the main config
+    setStorageConfig(storage_config);
 
     // Initialize storage
     if (!storage_->initialize()) {

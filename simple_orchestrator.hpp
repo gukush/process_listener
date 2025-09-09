@@ -129,6 +129,9 @@ public:
     bool run(const Config& cfg);
     void stop();
 
+    // Update storage configuration (must be called before run())
+    void setStorageConfig(const MetricsStorage::Config& config);
+
 private:
     // Process scanning
     std::vector<pid_t> scanForProcesses(const std::vector<std::string>& process_names);

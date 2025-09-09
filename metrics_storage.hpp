@@ -35,6 +35,9 @@ public:
     // Initialize storage and create output directory
     bool initialize();
 
+    // Update storage configuration (must be called before initialize())
+    void setStorageConfig(const Config& config);
+
     // Add metrics samples (thread-safe)
     void addOSMetrics(const std::vector<OSMetrics>& metrics);
     void addGPUMetrics(const std::vector<GPUMetrics>& metrics);
