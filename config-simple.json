@@ -19,8 +19,8 @@
   },
 
   "gpu_index": 0,
-  "os_interval_ms": 100,
-  "gpu_interval_ms": 50,
+  "os_interval_ms": 200,
+  "gpu_interval_ms": 100,
   "duration_sec": 0,
   "output_dir": "./metrics",
   "storage": {

@@ -64,7 +64,7 @@ public:
 
 private:
     std::vector<pid_t> monitored_pids_;
-    unsigned interval_ms_ = 100;
+    unsigned interval_ms_ = 200;
     std::atomic<bool> running_{false};
     mutable std::mutex metrics_mutex_;
     std::thread monitor_thread_;
@@ -82,7 +82,7 @@ public:
 
 private:
     unsigned gpu_index_ = 0;
-    unsigned interval_ms_ = 50;
+    unsigned interval_ms_ = 100;
     std::vector<pid_t> monitored_pids_;
     std::atomic<bool> running_{false};
     mutable std::mutex mx_;
@@ -113,8 +113,8 @@ public:
 
         // Sampling
         unsigned gpu_index = 0;
-        unsigned os_monitor_interval_ms  = 100;   // 100ms for OS metrics
-        unsigned gpu_monitor_interval_ms = 50;    // 50ms for GPU metrics
+        unsigned os_monitor_interval_ms  = 200;  // 200ms for OS metrics
+        unsigned gpu_monitor_interval_ms = 100;   // 100ms for GPU metrics
 
         // Run control
         int         duration_sec = 0; // 0 = run until signal

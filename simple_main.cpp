@@ -210,7 +210,7 @@ OSMetricsCollector::~OSMetricsCollector() { stopMonitoring(); }
 void OSMetricsCollector::startMonitoring(const std::vector<pid_t>& pids, unsigned interval_ms) {
     stopMonitoring();
     monitored_pids_ = pids;
-    interval_ms_ = interval_ms ? interval_ms : 100;
+    interval_ms_ = interval_ms ? interval_ms : 200;
     running_ = true;
     monitor_thread_ = std::thread([this]() {
         while (running_) {
@@ -258,7 +258,7 @@ GPUMetricsCollector::~GPUMetricsCollector() { stopMonitoring(); }
 void GPUMetricsCollector::startMonitoring(unsigned interval_ms, const std::vector<pid_t>& monitored_pids) {
 #if HAVE_CUDA
     stopMonitoring();
-    interval_ms_ = interval_ms ? interval_ms : 50;
+    interval_ms_ = interval_ms ? interval_ms : 100;
     monitored_pids_ = monitored_pids;
     running_ = true;
     worker_ = std::thread([this]() {
