@@ -320,7 +320,7 @@ std::unique_ptr<orc::Type> MetricsStorage::createGPUSchema() {
             orc::Type::buildTypeFromString(
                 "struct<timestamp:double,gpu_index:int,power_mw:int,"
                 "gpu_util_percent:int,mem_util_percent:int,mem_used_bytes:bigint,"
-                "sm_clock_mhz:int>"
+                "sm_clock_mhz:int,temperature_c:int>"
             )
         );
     } catch (const std::exception& e) {
@@ -396,6 +396,7 @@ void MetricsStorage::writeGPUBatch(orc::Writer* writer, const std::vector<GPUMet
         auto& memUtilCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[4]);
         auto& memUsedCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[5]);
         auto& smClockCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[6]);
+        auto& tempCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[7]);
 
         // Fill data
         for (size_t i = 0; i < metrics.size(); ++i) {
@@ -407,13 +408,14 @@ void MetricsStorage::writeGPUBatch(orc::Writer* writer, const std::vector<GPUMet
             memUtilCol.data[i] = static_cast<int64_t>(m.mem_util_percent);
             memUsedCol.data[i] = static_cast<int64_t>(m.mem_used_bytes);
             smClockCol.data[i] = static_cast<int64_t>(m.sm_clock_mhz);
+            tempCol.data[i] = static_cast<int64_t>(m.temperature_c);
         }
 
         // Set null indicators (all non-null for now)
         structBatch.numElements = static_cast<uint64_t>(metrics.size());
         structBatch.hasNulls = false;
 
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < 8; ++i) {
             structBatch.fields[i]->numElements = static_cast<uint64_t>(metrics.size());
             structBatch.fields[i]->hasNulls = false;
         }

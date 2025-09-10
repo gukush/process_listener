@@ -13,6 +13,7 @@ typedef struct { unsigned int pid; unsigned int smUtil; } nvmlProcessUtilization
 
 #define NVML_SUCCESS 0
 #define NVML_CLOCK_SM 0
+#define NVML_TEMPERATURE_GPU 0
 
 // Stub functions (no-ops when CUDA is disabled)
 inline nvmlReturn_t nvmlInit_v2() { return NVML_SUCCESS; }
@@ -22,6 +23,7 @@ inline nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t, unsigned int*) { retur
 inline nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t, nvmlUtilization_t*) { return NVML_SUCCESS; }
 inline nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t, nvmlMemory_t*) { return NVML_SUCCESS; }
 inline nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t, int, unsigned int*) { return NVML_SUCCESS; }
+inline nvmlReturn_t nvmlDeviceGetTemperature(nvmlDevice_t, int, unsigned int*) { return NVML_SUCCESS; }
 inline nvmlReturn_t nvmlDeviceGetProcessUtilization(nvmlDevice_t, nvmlProcessUtilizationSample_t*, unsigned int*, unsigned long long) { return NVML_SUCCESS; }
 inline const char* nvmlErrorString(nvmlReturn_t) { return "NVML disabled"; }
 

@@ -289,6 +289,9 @@ void GPUMetricsCollector::startMonitoring(unsigned interval_ms, const std::vecto
             unsigned int sm = 0;
             if (nvmlDeviceGetClockInfo(dev, NVML_CLOCK_SM, &sm) == NVML_SUCCESS) m.sm_clock_mhz = sm;
 
+            unsigned int temp = 0;
+            if (nvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &temp) == NVML_SUCCESS) m.temperature_c = temp;
+
             // Get per-process GPU utilization
             const unsigned int MAX_SAMPLES = 1024;
             std::vector<nvmlProcessUtilizationSample_t> samples(MAX_SAMPLES);

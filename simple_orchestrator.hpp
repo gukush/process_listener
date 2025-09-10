@@ -43,6 +43,7 @@ struct GPUMetrics {
     int        mem_util_percent = 0;
     std::uint64_t mem_used_bytes = 0;
     unsigned   sm_clock_mhz = 0;
+    unsigned   temperature_c = 0;  // GPU temperature in Celsius
 
     // Optional per-PID GPU util (smUtil) %
     std::map<unsigned, int> pid_gpu_percent;
