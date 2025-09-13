@@ -14,7 +14,7 @@ if(DEFINED CMAKE_TOOLCHAIN_FILE AND CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg")
 endif()
 
 # Dependencies
-# Boost: only 'system' is required (we use std::thread)
+# Boost: system, beast, asio for websocket support
 if(USING_VCPKG)
     find_package(Boost CONFIG REQUIRED COMPONENTS system)
 else()
@@ -45,6 +45,7 @@ set(SRCS
     simple_main.cpp
     metrics_storage.cpp
     os_metrics_linux.cpp
+    websocket_listener.cpp
 )
 
 add_executable(unified_monitor ${SRCS})
@@ -85,6 +86,11 @@ target_link_libraries(unified_monitor
         OpenSSL::Crypto
         pthread
 )
+
+# Add boost::beast and boost::asio dependencies
+# Note: boost::beast and boost::asio are header-only libraries in modern Boost
+# but we need to ensure the system library is linked for networking
+target_compile_definitions(unified_monitor PRIVATE BOOST_BEAST_USE_STD_STRING_VIEW)
 
 # NVML (CUDA) wiring
 if(HAVE_CUDA)

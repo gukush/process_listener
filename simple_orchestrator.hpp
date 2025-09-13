@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include "metrics_storage.hpp"
+#include "websocket_listener.hpp"
 
 namespace unified_monitor {
 
@@ -64,7 +65,7 @@ public:
 
 private:
     std::vector<pid_t> monitored_pids_;
-    unsigned interval_ms_ = 200;
+    unsigned interval_ms_ = 5000;
     std::atomic<bool> running_{false};
     mutable std::mutex metrics_mutex_;
     std::thread monitor_thread_;
@@ -82,7 +83,7 @@ public:
 
 private:
     unsigned gpu_index_ = 0;
-    unsigned interval_ms_ = 100;
+    unsigned interval_ms_ = 500;
     std::vector<pid_t> monitored_pids_;
     std::atomic<bool> running_{false};
     mutable std::mutex mx_;
@@ -111,10 +112,13 @@ public:
         // Chrome data directory filtering
         std::string chrome_data_dir = "";  // If specified, only monitor Chrome processes with this --user-data-dir
 
+        // Single PID monitoring
+        pid_t target_pid = -1;  // If > 0, monitor this specific PID instead of scanning for process names
+
         // Sampling
         unsigned gpu_index = 0;
-        unsigned os_monitor_interval_ms  = 200;  // 200ms for OS metrics
-        unsigned gpu_monitor_interval_ms = 100;   // 100ms for GPU metrics
+        unsigned os_monitor_interval_ms  = 1000;  // 1000ms for OS metrics
+        unsigned gpu_monitor_interval_ms = 500;   // 500ms for GPU metrics
 
         // Run control
         int         duration_sec = 0; // 0 = run until signal
@@ -122,6 +126,13 @@ public:
 
         // Storage configuration
         MetricsStorage::Config storage_config;
+
+        // WebSocket configuration
+        bool enable_websocket = false;
+        std::string websocket_host = "127.0.0.1";
+        std::string websocket_port = "8765";
+        std::string websocket_target = "/ws-listener";
+        bool websocket_use_ssl = true;
     };
 
     SimpleOrchestrator();
@@ -146,6 +157,9 @@ private:
     void stopMetricsCollection();
     void flushMetrics();
 
+    // WebSocket setup
+    void setupWebSocket(const Config& cfg);
+
     // Export functions
     void exportSummary(const Config& config);
 
@@ -153,8 +167,10 @@ private:
     std::unique_ptr<OSMetricsCollector>  os_collector_;
     std::unique_ptr<GPUMetricsCollector> gpu_collector_;
     std::unique_ptr<MetricsStorage>      storage_;
+    std::unique_ptr<WebSocketListener>   websocket_listener_;
 
     std::atomic<bool> running_{false};
+    std::atomic<bool> metrics_collecting_{false};
     std::vector<pid_t> monitored_pids_;
 };
 

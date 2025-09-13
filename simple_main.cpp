@@ -338,7 +338,8 @@ std::vector<GPUMetrics> GPUMetricsCollector::getMetrics() const {
 SimpleOrchestrator::SimpleOrchestrator()
     : os_collector_(std::make_unique<OSMetricsCollector>()),
       gpu_collector_(std::make_unique<GPUMetricsCollector>(0)),
-      storage_(std::make_unique<MetricsStorage>()) {}
+      storage_(std::make_unique<MetricsStorage>()),
+      websocket_listener_(std::make_unique<WebSocketListener>()) {}
 
 SimpleOrchestrator::~SimpleOrchestrator() { stop(); }
 
@@ -360,16 +361,37 @@ bool SimpleOrchestrator::run(const Config& cfg) {
         return false;
     }
 
-    // Scan for target processes
-    monitored_pids_ = scanForProcesses(cfg.target_process_names, cfg.chrome_data_dir);
+    // Scan for target processes or use specific PID
+    if (cfg.target_pid > 0) {
+        // Monitor specific PID
+        monitored_pids_ = {cfg.target_pid};
+        std::cout << "[Orchestrator] Monitoring specific PID: " << cfg.target_pid << std::endl;
 
-    if (monitored_pids_.empty()) {
-        std::cerr << "[Orchestrator] No target processes found to monitor" << std::endl;
-        return false;
+        // Verify the PID exists
+        std::ifstream proc_file("/proc/" + std::to_string(cfg.target_pid) + "/stat");
+        if (!proc_file.is_open()) {
+            std::cerr << "[Orchestrator] PID " << cfg.target_pid << " does not exist or is not accessible" << std::endl;
+            return false;
+        }
+        proc_file.close();
+    } else {
+        // Scan for target processes by name
+        monitored_pids_ = scanForProcesses(cfg.target_process_names, cfg.chrome_data_dir);
+
+        if (monitored_pids_.empty()) {
+            std::cerr << "[Orchestrator] No target processes found to monitor" << std::endl;
+            return false;
+        }
     }
 
-    // Start metrics collection
-    startMetricsCollection(cfg);
+    // Set up websocket connection if enabled
+    if (cfg.enable_websocket) {
+        setupWebSocket(cfg);
+    } else {
+        // If websocket is disabled, start metrics collection immediately
+        startMetricsCollection(cfg);
+        metrics_collecting_ = true;
+    }
 
     // Wait loop
     auto t0 = Clock::now();
@@ -378,7 +400,9 @@ bool SimpleOrchestrator::run(const Config& cfg) {
         if (cfg.duration_sec > 0 && Clock::now() - t0 > std::chrono::seconds(cfg.duration_sec)) break;
 
         // Periodically flush metrics to storage
-        flushMetrics();
+        if (metrics_collecting_) {
+            flushMetrics();
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 
@@ -391,9 +415,38 @@ bool SimpleOrchestrator::run(const Config& cfg) {
 
 void SimpleOrchestrator::stop() {
     running_ = false;
+    if (websocket_listener_) {
+        websocket_listener_->disconnect();
+    }
+}
+
+void SimpleOrchestrator::setupWebSocket(const Config& cfg) {
+    // Set up websocket callbacks
+    websocket_listener_->onStartMetrics = [this, &cfg]() {
+        std::cout << "[Orchestrator] WebSocket: Starting metrics collection..." << std::endl;
+        startMetricsCollection(cfg);
+        metrics_collecting_ = true;
+    };
+
+    websocket_listener_->onStopMetrics = [this]() {
+        std::cout << "[Orchestrator] WebSocket: Stopping metrics collection..." << std::endl;
+        stopMetricsCollection();
+        metrics_collecting_ = false;
+    };
+
+    // Connect to websocket server
+    if (!websocket_listener_->connect(cfg.websocket_host, cfg.websocket_port, cfg.websocket_target, cfg.websocket_use_ssl)) {
+        std::cerr << "[Orchestrator] Failed to connect to websocket server. Starting metrics collection immediately." << std::endl;
+        startMetricsCollection(cfg);
+        metrics_collecting_ = true;
+    } else {
+        std::cout << "[Orchestrator] Connected to websocket server. Waiting for start signal..." << std::endl;
+    }
 }
 
 void SimpleOrchestrator::startMetricsCollection(const Config& cfg) {
+    std::cout << "[Orchestrator] ===== MEASURING STARTS =====" << std::endl;
+
     // Start OS metrics collection with scanned PIDs
     os_collector_->startMonitoring(monitored_pids_, cfg.os_monitor_interval_ms);
 
@@ -407,6 +460,8 @@ void SimpleOrchestrator::startMetricsCollection(const Config& cfg) {
 }
 
 void SimpleOrchestrator::stopMetricsCollection() {
+    std::cout << "[Orchestrator] ===== MEASURING ENDS =====" << std::endl;
+
     os_collector_->stopMonitoring();
 #if HAVE_CUDA
     gpu_collector_->stopMonitoring();
@@ -462,14 +517,23 @@ static void print_usage(const char* argv0) {
     "  " << argv0 << " [--gpu-index N] [--os-interval MS] [--gpu-interval MS]\n"
     "               [--duration SEC] [--out-dir DIR]\n"
     "               [--process-names NAME1,NAME2,...]\n"
-    "               [--data-dir DIR]\n"
+    "               [--data-dir DIR] [--pid PID]\n"
+    "               [--websocket] [--ws-host HOST] [--ws-port PORT]\n"
+    "               [--ws-target PATH] [--ws-no-ssl]\n"
     "\n"
     "This tool scans for running processes named 'chrome' and 'native_client'\n"
     "by default and monitors their OS and GPU metrics.\n"
     "\n"
     "Options:\n"
     "  --data-dir DIR    Filter Chrome processes by --user-data-dir argument\n"
-    "                    Only monitor Chrome processes that use this data directory\n";
+    "                    Only monitor Chrome processes that use this data directory\n"
+    "  --pid PID         Monitor a specific process by its PID instead of scanning\n"
+    "                    for process names. Takes precedence over --process-names\n"
+    "  --websocket       Enable WebSocket connection for remote metrics control\n"
+    "  --ws-host HOST    WebSocket server host (default: 127.0.0.1)\n"
+    "  --ws-port PORT    WebSocket server port (default: 8765)\n"
+    "  --ws-target PATH  WebSocket target path (default: /ws-listener)\n"
+    "  --ws-no-ssl       Disable SSL for WebSocket connection\n";
 }
 
 // Helper function to split comma-separated string
@@ -523,6 +587,24 @@ int main(int argc, char** argv) {
         }
         else if (a == "--data-dir") {
             cfg.chrome_data_dir = need("--data-dir");
+        }
+        else if (a == "--pid") {
+            cfg.target_pid = static_cast<pid_t>(std::stoi(need("--pid")));
+        }
+        else if (a == "--websocket") {
+            cfg.enable_websocket = true;
+        }
+        else if (a == "--ws-host") {
+            cfg.websocket_host = need("--ws-host");
+        }
+        else if (a == "--ws-port") {
+            cfg.websocket_port = need("--ws-port");
+        }
+        else if (a == "--ws-target") {
+            cfg.websocket_target = need("--ws-target");
+        }
+        else if (a == "--ws-no-ssl") {
+            cfg.websocket_use_ssl = false;
         }
         else if (a == "--help" || a == "-h") {
             print_usage(argv[0]);

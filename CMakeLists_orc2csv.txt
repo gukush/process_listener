@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.20)
+project(orc2csv CXX)
+set(CMAKE_CXX_STANDARD 17)
+
+find_package(orc CONFIG REQUIRED)
+find_package(zstd CONFIG REQUIRED)  # <-- make sure we import zstd from vcpkg
+
+# Pick the right zstd imported target depending on what's available
+if(TARGET zstd::libzstd_shared)
+  set(ZSTD_TARGET zstd::libzstd_shared)
+elseif(TARGET zstd::libzstd_static)
+  set(ZSTD_TARGET zstd::libzstd_static)
+elseif(TARGET ZSTD::ZSTD)  # some ports export this alias
+  set(ZSTD_TARGET ZSTD::ZSTD)
+else()
+  message(FATAL_ERROR "No suitable zstd CMake target found. Try `vcpkg install zstd` and reconfigure.")
+endif()
+
+add_executable(orc2csv orc2csv.cpp)
+target_link_libraries(orc2csv PRIVATE orc::orc ${ZSTD_TARGET})
