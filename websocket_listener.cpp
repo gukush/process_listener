@@ -5,7 +5,7 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 #include <boost/asio/ssl.hpp>
-#include <boost/url.hpp>
+#include <regex>
 
 namespace beast = boost::beast;
 namespace websocket = beast::websocket;
@@ -27,33 +27,65 @@ WebSocketListener::~WebSocketListener() {
     disconnect();
 }
 
+// Simple URL parser function
+struct ParsedURL {
+    std::string scheme;
+    std::string host;
+    std::string port;
+    std::string path;
+};
+
+ParsedURL parseURL(const std::string& url) {
+    ParsedURL result;
+
+    // Regex to parse URL: (scheme)://(host):(port)(path)
+    std::regex url_regex(R"(^(wss?):\/\/([^:\/]+)(?::(\d+))?(\/.*)?$)");
+    std::smatch matches;
+
+    if (std::regex_match(url, matches, url_regex)) {
+        result.scheme = matches[1].str();
+        result.host = matches[2].str();
+        result.port = matches[3].str();
+        result.path = matches[4].str();
+
+        // Set default ports
+        if (result.port.empty()) {
+            result.port = (result.scheme == "wss") ? "443" : "80";
+        }
+
+        // Set default path
+        if (result.path.empty()) {
+            result.path = "/";
+        }
+    } else {
+        throw std::invalid_argument("Invalid URL format");
+    }
+
+    return result;
+}
+
 bool WebSocketListener::connect(const std::string& url) {
     try {
         // Parse the WebSocket URL
-        boost::url::url_view parsed_url(url);
+        ParsedURL parsed_url = parseURL(url);
 
-        std::string scheme = std::string(parsed_url.scheme());
-        std::string host = std::string(parsed_url.host());
-        std::string port = parsed_url.port().empty() ?
-            (scheme == "wss" ? "443" : "80") :
-            std::string(parsed_url.port());
-        std::string target = parsed_url.path().empty() ? "/" : std::string(parsed_url.path());
+        use_ssl_connection = (parsed_url.scheme == "wss");
 
-        use_ssl_connection = (scheme == "wss");
-
-        std::cout << "[WS-Listener] Connecting to " << scheme << "://" << host << ":" << port << target << std::endl;
+        std::cout << "[WS-Listener] Connecting to " << parsed_url.scheme << "://"
+                  << parsed_url.host << ":" << parsed_url.port << parsed_url.path << std::endl;
 
         // Resolve hostname with better error handling
         boost::system::error_code ec;
-        auto results = resolver.resolve(host, port, ec);
+        auto results = resolver.resolve(parsed_url.host, parsed_url.port, ec);
 
         if (ec) {
-            std::cerr << "[WS-Listener] DNS resolution failed for " << host << ":" << port << " - " << ec.message() << std::endl;
+            std::cerr << "[WS-Listener] DNS resolution failed for " << parsed_url.host
+                      << ":" << parsed_url.port << " - " << ec.message() << std::endl;
 
             // Try fallback for localhost addresses
-            if (host == "127.0.0.1" || host == "localhost") {
+            if (parsed_url.host == "127.0.0.1" || parsed_url.host == "localhost") {
                 std::cerr << "[WS-Listener] Trying fallback resolution for localhost..." << std::endl;
-                results = resolver.resolve(tcp::v4(), host, port, ec);
+                results = resolver.resolve(tcp::v4(), parsed_url.host, parsed_url.port, ec);
                 if (ec) {
                     std::cerr << "[WS-Listener] Fallback DNS resolution also failed: " << ec.message() << std::endl;
                     return false;
@@ -74,10 +106,10 @@ bool WebSocketListener::connect(const std::string& url) {
             socket.connect(results);
 
             // Update the host string for SNI
-            std::string hostWithPort = host + ':' + port;
+            std::string hostWithPort = parsed_url.host + ':' + parsed_url.port;
 
             // Set SNI Hostname (many hosts need this to handshake successfully)
-            if (!SSL_set_tlsext_host_name(ssl_ws->next_layer().native_handle(), host.c_str())) {
+            if (!SSL_set_tlsext_host_name(ssl_ws->next_layer().native_handle(), parsed_url.host.c_str())) {
                 beast::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
                 throw beast::system_error{ec};
             }
@@ -92,9 +124,9 @@ bool WebSocketListener::connect(const std::string& url) {
                 }));
 
             // Connect to the WebSocket endpoint
-            ssl_ws->handshake(hostWithPort, target);
+            ssl_ws->handshake(hostWithPort, parsed_url.path);
 
-            std::cout << "[WS-Listener] Connected to SSL WebSocket endpoint: " << target << std::endl;
+            std::cout << "[WS-Listener] Connected to SSL WebSocket endpoint: " << parsed_url.path << std::endl;
         } else {
             // Plain WebSocket connection
             plain_ws = std::make_unique<boost::beast::websocket::stream<boost::beast::tcp_stream>>(ioc);
@@ -112,9 +144,9 @@ bool WebSocketListener::connect(const std::string& url) {
                 }));
 
             // Connect to the WebSocket endpoint
-            plain_ws->handshake(host, target);
+            plain_ws->handshake(parsed_url.host, parsed_url.path);
 
-            std::cout << "[WS-Listener] Connected to plain WebSocket endpoint: " << target << std::endl;
+            std::cout << "[WS-Listener] Connected to plain WebSocket endpoint: " << parsed_url.path << std::endl;
         }
 
         // Start the event loop in a separate thread

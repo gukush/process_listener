@@ -14,12 +14,46 @@
 #include <unistd.h>
 
 #include "metrics_storage.hpp"
-#include "os_metrics_linux.hpp"
 #include "websocket_listener.hpp"
 
 namespace unified_monitor {
 
 using Clock = std::chrono::steady_clock;
+
+// ------------------------------ OSMetrics --------------------------
+struct OSMetrics {
+    double timestamp = 0.0;
+    pid_t pid = 0;
+    long mem_rss_kb = 0;        // Resident Set Size in KB
+    long mem_vms_kb = 0;        // Virtual Memory Size in KB
+    double cpu_percent = 0.0;   // CPU utilization percentage
+    uint64_t disk_read_bytes = 0;
+    uint64_t disk_write_bytes = 0;
+    uint64_t net_recv_bytes = 0;
+    uint64_t net_sent_bytes = 0;
+};
+
+// ------------------------------ OSMetricsCollector --------------------------
+class OSMetricsCollector {
+public:
+    OSMetricsCollector();
+    ~OSMetricsCollector();
+
+    void startMonitoring(const std::vector<pid_t>& pids, unsigned interval_ms);
+    void stopMonitoring();
+    std::vector<OSMetrics> getMetrics() const;
+
+    // Static method to collect metrics for a single PID
+    static OSMetrics collectForPid(pid_t pid);
+
+private:
+    std::vector<pid_t> monitored_pids_;
+    unsigned interval_ms_ = 200;
+    std::atomic<bool> running_{false};
+    std::thread monitor_thread_;
+    mutable std::mutex metrics_mutex_;
+    std::vector<OSMetrics> metrics_;
+};
 
 // ------------------------------ GPUMetrics --------------------------
 struct GPUMetrics {
