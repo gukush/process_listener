@@ -2,76 +2,39 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
-#include <sys/types.h> // pid_t
-#include <nlohmann/json.hpp>
+#include <unistd.h>
 
 #include "metrics_storage.hpp"
+#include "os_metrics_linux.hpp"
 #include "websocket_listener.hpp"
 
 namespace unified_monitor {
 
-// A steady clock used for timepoints inside the app
 using Clock = std::chrono::steady_clock;
 
-// --------- Metric data structures ---------
-struct OSMetrics {
-    double     timestamp = 0.0;    // seconds since epoch
-    pid_t      pid = -1;
-
-    double     cpu_percent = 0.0;  // optional; 0 if not computed
-    long       mem_rss_kb = 0;
-    long       mem_vms_kb = 0;
-
-    std::uint64_t disk_read_bytes  = 0;
-    std::uint64_t disk_write_bytes = 0;
-    std::uint64_t net_recv_bytes   = 0;
-    std::uint64_t net_sent_bytes   = 0;
-};
-
+// ------------------------------ GPUMetrics --------------------------
 struct GPUMetrics {
-    double     timestamp = 0.0;
-    unsigned   gpu_index = 0;
-
-    unsigned   power_mw = 0;
-    int        gpu_util_percent = 0;
-    int        mem_util_percent = 0;
-    std::uint64_t mem_used_bytes = 0;
-    unsigned   sm_clock_mhz = 0;
-    unsigned   temperature_c = 0;  // GPU temperature in Celsius
-
-    // Optional per-PID GPU util (smUtil) %
-    std::map<unsigned, int> pid_gpu_percent;
+    double timestamp = 0.0;
+    unsigned int gpu_index = 0;
+    unsigned int power_mw = 0;
+    unsigned int gpu_util_percent = 0;
+    unsigned int mem_util_percent = 0;
+    uint64_t mem_used_bytes = 0;
+    unsigned int sm_clock_mhz = 0;
+    unsigned int temperature_c = 0;
+    std::map<unsigned int, unsigned int> pid_gpu_percent; // pid -> sm utilization %
 };
 
-// --------- Collectors ---------
-class OSMetricsCollector {
-public:
-    OSMetricsCollector();
-    ~OSMetricsCollector();
-
-    void startMonitoring(const std::vector<pid_t>& pids, unsigned interval_ms);
-    void stopMonitoring();
-    std::vector<OSMetrics> getMetrics() const;
-
-    // Implemented in os_metrics_linux.cpp
-    OSMetrics collectForPid(pid_t pid);
-
-private:
-    std::vector<pid_t> monitored_pids_;
-    unsigned interval_ms_ = 5000;
-    std::atomic<bool> running_{false};
-    mutable std::mutex metrics_mutex_;
-    std::thread monitor_thread_;
-    std::vector<OSMetrics> metrics_;
-};
-
+// ------------------------------ GPUMetricsCollector --------------------------
 class GPUMetricsCollector {
 public:
     explicit GPUMetricsCollector(unsigned gpu_index);
@@ -82,57 +45,37 @@ public:
     std::vector<GPUMetrics> getMetrics() const;
 
 private:
-    unsigned gpu_index_ = 0;
-    unsigned interval_ms_ = 500;
+    unsigned gpu_index_;
+    unsigned interval_ms_ = 100;
     std::vector<pid_t> monitored_pids_;
     std::atomic<bool> running_{false};
-    mutable std::mutex mx_;
     std::thread worker_;
+    mutable std::mutex mx_;
     std::vector<GPUMetrics> samples_;
 };
 
-// --------- Process command specs for config-driven launch ---------
-struct CommandSpec {
-    bool enabled = true;                          // if false, skip launching
-    bool shell = false;                           // true => run via /bin/sh -lc "cmd"
-    std::vector<std::string> argv;                // argv form (takes precedence over cmd)
-    std::string cmd;                              // full shell command (if shell=true or argv empty)
-    std::string cwd;                              // working directory (optional)
-    std::map<std::string, std::string> env;       // extra environment (optional)
-};
-
-// --------- Simplified Orchestrator ---------
-
+// ------------------------------ SimpleOrchestrator --------------------------
 class SimpleOrchestrator {
 public:
     struct Config {
-        // Process names to scan for (no more spawning)
+        // Process monitoring
         std::vector<std::string> target_process_names = {"chrome", "native_client"};
+        std::string chrome_data_dir;
+        pid_t target_pid = 0; // If > 0, monitor specific PID instead of scanning
 
-        // Chrome data directory filtering
-        std::string chrome_data_dir = "";  // If specified, only monitor Chrome processes with this --user-data-dir
-
-        // Single PID monitoring
-        pid_t target_pid = -1;  // If > 0, monitor this specific PID instead of scanning for process names
-
-        // Sampling
+        // Metrics intervals
         unsigned gpu_index = 0;
-        unsigned os_monitor_interval_ms  = 1000;  // 1000ms for OS metrics
-        unsigned gpu_monitor_interval_ms = 500;   // 500ms for GPU metrics
+        unsigned os_monitor_interval_ms = 200;
+        unsigned gpu_monitor_interval_ms = 100;
+        int duration_sec = 0; // 0 = run until interrupted
 
-        // Run control
-        int         duration_sec = 0; // 0 = run until signal
+        // Output
         std::string output_dir = "./metrics";
-
-        // Storage configuration
         MetricsStorage::Config storage_config;
 
-        // WebSocket configuration
-        bool enable_websocket = false;
-        std::string websocket_host = "127.0.0.1";
-        std::string websocket_port = "8765";
-        std::string websocket_target = "/ws-listener";
-        bool websocket_use_ssl = true;
+        // WebSocket connection (URL-based like main.cpp)
+        std::string websocket_url; // e.g., "wss://127.0.0.1:3001" or "ws://127.0.0.1:3001"
+        // Note: insecure connections (self-signed certs) are handled automatically in WebSocketListener
     };
 
     SimpleOrchestrator();
@@ -140,34 +83,26 @@ public:
 
     bool run(const Config& cfg);
     void stop();
-
-    // Update storage configuration (must be called before run())
     void setStorageConfig(const MetricsStorage::Config& config);
 
-private:
-    // Process scanning
-    std::vector<pid_t> scanForProcesses(const std::vector<std::string>& process_names);
-    std::vector<pid_t> scanForProcesses(const std::vector<std::string>& process_names, const std::string& chrome_data_dir);
-    std::vector<pid_t> getPidsByName(const std::string& process_name);
-    std::string getProcessCmdline(pid_t pid);
-    bool hasChromeDataDir(pid_t pid, const std::string& data_dir);
+    // Process scanning utilities
+    static std::vector<pid_t> getPidsByName(const std::string& process_name);
+    static std::vector<pid_t> scanForProcesses(const std::vector<std::string>& process_names);
+    static std::vector<pid_t> scanForProcesses(const std::vector<std::string>& process_names, const std::string& chrome_data_dir);
+    static std::string getProcessCmdline(pid_t pid);
+    static bool hasChromeDataDir(pid_t pid, const std::string& data_dir);
 
-    // Metrics collection - Fix: change signature to match implementation
+private:
+    void setupWebSocket(const Config& cfg);
     void startMetricsCollection(const Config& cfg);
     void stopMetricsCollection();
     void flushMetrics();
-
-    // WebSocket setup
-    void setupWebSocket(const Config& cfg);
-
-    // Export functions
     void exportSummary(const Config& config);
 
-private:
-    std::unique_ptr<OSMetricsCollector>  os_collector_;
+    std::unique_ptr<OSMetricsCollector> os_collector_;
     std::unique_ptr<GPUMetricsCollector> gpu_collector_;
-    std::unique_ptr<MetricsStorage>      storage_;
-    std::unique_ptr<WebSocketListener>   websocket_listener_;
+    std::unique_ptr<MetricsStorage> storage_;
+    std::unique_ptr<WebSocketListener> websocket_listener_;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> metrics_collecting_{false};

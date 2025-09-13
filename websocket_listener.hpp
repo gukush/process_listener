@@ -17,7 +17,8 @@ public:
     WebSocketListener();
     ~WebSocketListener();
 
-    bool connect(const std::string& host, const std::string& port, const std::string& target="/ws-listener", bool use_ssl=true);
+    // Updated interface - now takes a single URL like websocket_client
+    bool connect(const std::string& url);
     void disconnect();
     bool isConnected() const;
 
@@ -41,4 +42,3 @@ private:
     std::thread ioThread;
     std::atomic<bool> shouldStop{false};
 };
-

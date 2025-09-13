@@ -27,33 +27,56 @@ WebSocketListener::~WebSocketListener() {
     disconnect();
 }
 
-bool WebSocketListener::connect(const std::string& host, const std::string& port, const std::string& target, bool use_ssl) {
+bool WebSocketListener::connect(const std::string& url) {
     try {
-        // Resolve hostname
+        // Parse the WebSocket URL
+        boost::url::url_view parsed_url(url);
+
+        std::string scheme = std::string(parsed_url.scheme());
+        std::string host = std::string(parsed_url.host());
+        std::string port = parsed_url.port().empty() ?
+            (scheme == "wss" ? "443" : "80") :
+            std::string(parsed_url.port());
+        std::string target = parsed_url.path().empty() ? "/" : std::string(parsed_url.path());
+
+        use_ssl_connection = (scheme == "wss");
+
+        std::cout << "[WS-Listener] Connecting to " << scheme << "://" << host << ":" << port << target << std::endl;
+
+        // Resolve hostname with better error handling
         boost::system::error_code ec;
         auto results = resolver.resolve(host, port, ec);
 
         if (ec) {
             std::cerr << "[WS-Listener] DNS resolution failed for " << host << ":" << port << " - " << ec.message() << std::endl;
-            return false;
+
+            // Try fallback for localhost addresses
+            if (host == "127.0.0.1" || host == "localhost") {
+                std::cerr << "[WS-Listener] Trying fallback resolution for localhost..." << std::endl;
+                results = resolver.resolve(tcp::v4(), host, port, ec);
+                if (ec) {
+                    std::cerr << "[WS-Listener] Fallback DNS resolution also failed: " << ec.message() << std::endl;
+                    return false;
+                }
+            } else {
+                return false;
+            }
         }
 
-        use_ssl_connection = use_ssl;
-
-        if (use_ssl) {
+        if (use_ssl_connection) {
             // SSL WebSocket connection
             ssl_ws = std::make_unique<boost::beast::websocket::stream<boost::asio::ssl::stream<boost::beast::tcp_stream>>>(ioc, ssl_ctx);
 
             // Get the underlying socket
             auto& socket = beast::get_lowest_layer(*ssl_ws);
 
-            // Make the connection
+            // Make the connection on the IP address we get from a lookup
             socket.connect(results);
 
             // Update the host string for SNI
             std::string hostWithPort = host + ':' + port;
 
-            // Set SNI Hostname
+            // Set SNI Hostname (many hosts need this to handshake successfully)
             if (!SSL_set_tlsext_host_name(ssl_ws->next_layer().native_handle(), host.c_str())) {
                 beast::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
                 throw beast::system_error{ec};
@@ -79,7 +102,7 @@ bool WebSocketListener::connect(const std::string& host, const std::string& port
             // Get the underlying socket
             auto& socket = plain_ws->next_layer();
 
-            // Make the connection
+            // Make the connection on the IP address we get from a lookup
             socket.connect(results);
 
             // Set a decorator to change the User-Agent of the handshake
