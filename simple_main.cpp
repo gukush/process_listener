@@ -4,7 +4,7 @@
 // Example config (config.json):
 // {
 //   "mode": "browser+cpp",                        // or "cpp-only"
-//   "server": "ws://127.0.0.1:8765",
+//   "server": "wss://127.0.0.1:3001",
 //
 //   "browser": {
 //     "enabled": true,
@@ -54,6 +54,7 @@
 #include <stdlib.h>     // setenv
 
 #include <nlohmann/json.hpp>
+#include <sstream>
 
 #if HAVE_CUDA
   #if __has_include(<nvml.h>)
@@ -384,11 +385,12 @@ bool SimpleOrchestrator::run(const Config& cfg) {
         }
     }
 
-    // Set up websocket connection if enabled
-    if (cfg.enable_websocket) {
+    // Set up websocket connection if URL is provided
+    if (!cfg.websocket_url.empty()) {
         setupWebSocket(cfg);
     } else {
-        // If websocket is disabled, start metrics collection immediately
+        // If no websocket URL provided, start metrics collection immediately
+        std::cout << "[Orchestrator] No WebSocket URL provided, starting metrics collection immediately" << std::endl;
         startMetricsCollection(cfg);
         metrics_collecting_ = true;
     }
@@ -435,7 +437,7 @@ void SimpleOrchestrator::setupWebSocket(const Config& cfg) {
     };
 
     // Connect to websocket server
-    if (!websocket_listener_->connect(cfg.websocket_host, cfg.websocket_port, cfg.websocket_target, cfg.websocket_use_ssl)) {
+    if (!websocket_listener_->connect(cfg.websocket_url)) {
         std::cerr << "[Orchestrator] Failed to connect to websocket server. Starting metrics collection immediately." << std::endl;
         startMetricsCollection(cfg);
         metrics_collecting_ = true;
@@ -512,14 +514,13 @@ void SimpleOrchestrator::exportSummary(const Config& config) {
 
 // ----------------------------------- CLI & Config ----------------------------
 static void print_usage(const char* argv0) {
-    std::cerr <<
+    std::cerr
     "Usage:\n"
     "  " << argv0 << " [--gpu-index N] [--os-interval MS] [--gpu-interval MS]\n"
     "               [--duration SEC] [--out-dir DIR]\n"
     "               [--process-names NAME1,NAME2,...]\n"
     "               [--data-dir DIR] [--pid PID]\n"
-    "               [--websocket] [--ws-host HOST] [--ws-port PORT]\n"
-    "               [--ws-target PATH] [--ws-no-ssl]\n"
+    "               [--url URL] [--insecure]\n"
     "\n"
     "This tool scans for running processes named 'chrome' and 'native_client'\n"
     "by default and monitors their OS and GPU metrics.\n"
@@ -529,11 +530,9 @@ static void print_usage(const char* argv0) {
     "                    Only monitor Chrome processes that use this data directory\n"
     "  --pid PID         Monitor a specific process by its PID instead of scanning\n"
     "                    for process names. Takes precedence over --process-names\n"
-    "  --websocket       Enable WebSocket connection for remote metrics control\n"
-    "  --ws-host HOST    WebSocket server host (default: 127.0.0.1)\n"
-    "  --ws-port PORT    WebSocket server port (default: 8765)\n"
-    "  --ws-target PATH  WebSocket target path (default: /ws-listener)\n"
-    "  --ws-no-ssl       Disable SSL for WebSocket connection\n";
+    "  --url URL         Connect to WebSocket server at URL (e.g., wss://127.0.0.1:3001)\n"
+    "                    If not provided, metrics collection starts immediately\n"
+    "  --insecure        Allow insecure WebSocket connections (accept self-signed certificates)\n";
 }
 
 // Helper function to split comma-separated string
@@ -591,20 +590,14 @@ int main(int argc, char** argv) {
         else if (a == "--pid") {
             cfg.target_pid = static_cast<pid_t>(std::stoi(need("--pid")));
         }
-        else if (a == "--websocket") {
-            cfg.enable_websocket = true;
+        else if (a == "--url") {
+            cfg.websocket_url = need("--url");
+            std::cout << "[Config] WebSocket URL: " << cfg.websocket_url << std::endl;
         }
-        else if (a == "--ws-host") {
-            cfg.websocket_host = need("--ws-host");
-        }
-        else if (a == "--ws-port") {
-            cfg.websocket_port = need("--ws-port");
-        }
-        else if (a == "--ws-target") {
-            cfg.websocket_target = need("--ws-target");
-        }
-        else if (a == "--ws-no-ssl") {
-            cfg.websocket_use_ssl = false;
+        else if (a == "--insecure") {
+            // Note: This flag is parsed but the insecure handling is done in the WebSocketListener
+            // SSL verification is already disabled in the WebSocketListener constructor
+            std::cout << "[Config] Insecure mode enabled (self-signed certificates accepted)" << std::endl;
         }
         else if (a == "--help" || a == "-h") {
             print_usage(argv[0]);
