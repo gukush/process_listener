@@ -515,7 +515,7 @@ void SimpleOrchestrator::exportSummary(const Config& config) {
 // ----------------------------------- CLI & Config ----------------------------
 static void print_usage(const char* argv0) {
     std::cerr
-    "Usage:\n"
+    <<"Usage:\n"
     "  " << argv0 << " [--gpu-index N] [--os-interval MS] [--gpu-interval MS]\n"
     "               [--duration SEC] [--out-dir DIR]\n"
     "               [--process-names NAME1,NAME2,...]\n"
