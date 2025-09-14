@@ -300,7 +300,7 @@ std::unique_ptr<orc::Type> MetricsStorage::createOSSchema() {
     try {
         return std::unique_ptr<orc::Type>(
             orc::Type::buildTypeFromString(
-                "struct<timestamp:double,pid:bigint,cpu_percent:double,mem_rss_kb:bigint,"
+                "struct<ts_unix_ns:bigint,pid:bigint,cpu_percent:double,mem_rss_kb:bigint,"
                 "mem_vms_kb:bigint,disk_read_bytes:bigint,disk_write_bytes:bigint,"
                 "net_recv_bytes:bigint,net_sent_bytes:bigint>"
             )

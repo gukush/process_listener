@@ -22,15 +22,16 @@ using Clock = std::chrono::steady_clock;
 
 // ------------------------------ OSMetrics --------------------------
 struct OSMetrics {
-    double timestamp = 0.0;
-    pid_t pid = 0;
-    long mem_rss_kb = 0;        // Resident Set Size in KB
-    long mem_vms_kb = 0;        // Virtual Memory Size in KB
-    double cpu_percent = 0.0;   // CPU utilization percentage
+    // precise and sortable:
+    int64_t ts_unix_ns = 0;
+    pid_t   pid = 0;
+    long    mem_rss_kb = 0;
+    long    mem_vms_kb = 0;
+    double  cpu_percent = 0.0;
     uint64_t disk_read_bytes = 0;
     uint64_t disk_write_bytes = 0;
-    uint64_t net_recv_bytes = 0;
-    uint64_t net_sent_bytes = 0;
+    uint64_t net_recv_bytes = 0; // NOTE: system-wide deltas, not per-PID
+    uint64_t net_sent_bytes = 0; // NOTE: system-wide deltas, not per-PID
 };
 
 // ------------------------------ OSMetricsCollector --------------------------
