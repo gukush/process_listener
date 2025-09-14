@@ -298,10 +298,9 @@ void MetricsStorage::closeFile(FileWriter& writer) {
 
 std::unique_ptr<orc::Type> MetricsStorage::createOSSchema() {
     try {
-        // Use the correct ORC API to build schema from string
         return std::unique_ptr<orc::Type>(
             orc::Type::buildTypeFromString(
-                "struct<timestamp:double,pid:int,cpu_percent:float,mem_rss_kb:bigint,"
+                "struct<timestamp:double,pid:bigint,cpu_percent:double,mem_rss_kb:bigint,"
                 "mem_vms_kb:bigint,disk_read_bytes:bigint,disk_write_bytes:bigint,"
                 "net_recv_bytes:bigint,net_sent_bytes:bigint>"
             )
