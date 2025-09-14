@@ -338,38 +338,38 @@ void MetricsStorage::writeOSBatch(orc::Writer* writer, const std::vector<OSMetri
         auto batch = writer->createRowBatch(static_cast<uint64_t>(metrics.size()));
         auto& structBatch = dynamic_cast<orc::StructVectorBatch&>(*batch);
 
-        // Get column vectors
-        auto& timestampCol = dynamic_cast<orc::DoubleVectorBatch&>(*structBatch.fields[0]);
-        auto& pidCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[1]);
-        auto& cpuCol = dynamic_cast<orc::DoubleVectorBatch&>(*structBatch.fields[2]);
-        auto& memRssCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[3]);
-        auto& memVmsCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[4]);
-        auto& diskReadCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[5]);
+        // Column vectors (note: col 0 is now BIGINT ts_unix_ns)
+        auto& tsNsCol      = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[0]);
+        auto& pidCol       = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[1]);
+        auto& cpuCol       = dynamic_cast<orc::DoubleVectorBatch&>(*structBatch.fields[2]);
+        auto& memRssCol    = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[3]);
+        auto& memVmsCol    = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[4]);
+        auto& diskReadCol  = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[5]);
         auto& diskWriteCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[6]);
-        auto& netRecvCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[7]);
-        auto& netSentCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[8]);
+        auto& netRecvCol   = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[7]);
+        auto& netSentCol   = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[8]);
 
         // Fill data
         for (size_t i = 0; i < metrics.size(); ++i) {
             const auto& m = metrics[i];
-            timestampCol.data[i] = m.timestamp;
-            pidCol.data[i] = static_cast<int64_t>(m.pid);
-            cpuCol.data[i] = static_cast<double>(m.cpu_percent);
-            memRssCol.data[i] = static_cast<int64_t>(m.mem_rss_kb);
-            memVmsCol.data[i] = static_cast<int64_t>(m.mem_vms_kb);
-            diskReadCol.data[i] = static_cast<int64_t>(m.disk_read_bytes);
+
+            tsNsCol.data[i]      = static_cast<int64_t>(m.ts_unix_ns);   // precise wall-clock ns
+            pidCol.data[i]       = static_cast<int64_t>(m.pid);
+            cpuCol.data[i]       = static_cast<double>(m.cpu_percent);
+            memRssCol.data[i]    = static_cast<int64_t>(m.mem_rss_kb);
+            memVmsCol.data[i]    = static_cast<int64_t>(m.mem_vms_kb);
+            diskReadCol.data[i]  = static_cast<int64_t>(m.disk_read_bytes);
             diskWriteCol.data[i] = static_cast<int64_t>(m.disk_write_bytes);
-            netRecvCol.data[i] = static_cast<int64_t>(m.net_recv_bytes);
-            netSentCol.data[i] = static_cast<int64_t>(m.net_sent_bytes);
+            netRecvCol.data[i]   = static_cast<int64_t>(m.net_recv_bytes);
+            netSentCol.data[i]   = static_cast<int64_t>(m.net_sent_bytes);
         }
 
-        // Set null indicators (all non-null for now)
+        // Non-null columns
         structBatch.numElements = static_cast<uint64_t>(metrics.size());
         structBatch.hasNulls = false;
-
-        for (int i = 0; i < 9; ++i) {
-            structBatch.fields[i]->numElements = static_cast<uint64_t>(metrics.size());
-            structBatch.fields[i]->hasNulls = false;
+        for (int c = 0; c < 9; ++c) {
+            structBatch.fields[c]->numElements = static_cast<uint64_t>(metrics.size());
+            structBatch.fields[c]->hasNulls = false;
         }
 
         writer->add(*batch);
@@ -378,7 +378,6 @@ void MetricsStorage::writeOSBatch(orc::Writer* writer, const std::vector<OSMetri
         throw;
     }
 }
-
 void MetricsStorage::writeGPUBatch(orc::Writer* writer, const std::vector<GPUMetrics>& metrics) {
 #if HAVE_CUDA
     if (metrics.empty()) return;
