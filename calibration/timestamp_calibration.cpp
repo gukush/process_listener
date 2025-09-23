@@ -205,17 +205,17 @@ public:
         } else if (age.count() < 24) {
             std::cout << "✓ Calibration is recent (< 24 hours) - MEDIUM TRUST" << std::endl;
             if (std::abs(estimated_drift_seconds) > 0.001) {
-                std::cout << "⚠ Warning: Significant drift expected (" << (estimated_drift_seconds * 1000) << " ms)" << std::endl;
+                std::cout << " Warning: Significant drift expected (" << (estimated_drift_seconds * 1000) << " ms)" << std::endl;
             }
         } else {
-            std::cout << "⚠ Calibration is old (> 24 hours) - LOW TRUST" << std::endl;
-            std::cout << "⚠ Significant drift expected (" << (estimated_drift_seconds * 1000) << " ms)" << std::endl;
-            std::cout << "⚠ Consider re-calibrating for accurate results" << std::endl;
+            std::cout << " Calibration is old (> 24 hours) - LOW TRUST" << std::endl;
+            std::cout << " Significant drift expected (" << (estimated_drift_seconds * 1000) << " ms)" << std::endl;
+            std::cout << " Consider re-calibrating for accurate results" << std::endl;
         }
 
         // System clock stability check
         if (std::abs(drift_ppm_) > 100) {
-            std::cout << "⚠ High drift detected (" << drift_ppm_ << " ppm) - system clock may be unstable" << std::endl;
+            std::cout << " High drift detected (" << drift_ppm_ << " ppm) - system clock may be unstable" << std::endl;
         } else {
             std::cout << "✓ Low drift detected (" << drift_ppm_ << " ppm) - system clock appears stable" << std::endl;
         }
