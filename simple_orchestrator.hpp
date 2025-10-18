@@ -58,7 +58,8 @@ private:
 
 // ------------------------------ GPUMetrics --------------------------
 struct GPUMetrics {
-    double timestamp = 0.0;
+    double monotonic_ts = 0.0;
+    int64_t ts_unix_ns = 0;
     unsigned int gpu_index = 0;
     unsigned int power_mw = 0;
     unsigned int gpu_util_percent = 0;
@@ -66,7 +67,16 @@ struct GPUMetrics {
     uint64_t mem_used_bytes = 0;
     unsigned int sm_clock_mhz = 0;
     unsigned int temperature_c = 0;
-    std::map<unsigned int, unsigned int> pid_gpu_percent; // pid -> sm utilization %
+    std::map<pid_t, unsigned int> pid_gpu_percent; // pid -> sm utilization %
+};
+
+struct GPUPidMetrics {
+    double monotonic_ts = 0.0;
+    int64_t ts_unix_ns = 0;
+    unsigned int gpu_index = 0;
+    pid_t pid = 0;
+    unsigned int sm_util_percent = 0;
+    unsigned int mem_util_percent = 0;
 };
 
 // ------------------------------ GPUMetricsCollector --------------------------
@@ -75,9 +85,11 @@ public:
     explicit GPUMetricsCollector(unsigned gpu_index);
     ~GPUMetricsCollector();
 
+    void setEnablePidMetrics(bool enabled);
     void startMonitoring(unsigned interval_ms, const std::vector<pid_t>& monitored_pids = {});
     void stopMonitoring();
     std::vector<GPUMetrics> getMetrics() const;
+    std::vector<GPUPidMetrics> getPidMetrics() const;
 
 private:
     unsigned gpu_index_;
@@ -87,6 +99,8 @@ private:
     std::thread worker_;
     mutable std::mutex mx_;
     std::vector<GPUMetrics> samples_;
+    std::vector<GPUPidMetrics> pid_samples_;
+    std::atomic<bool> enable_pid_metrics_{true};
 };
 
 // ------------------------------ SimpleOrchestrator --------------------------
@@ -142,6 +156,7 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> metrics_collecting_{false};
     std::vector<pid_t> monitored_pids_;
+    bool enable_gpu_pid_metrics_ = true;
 };
 
 } // namespace unified_monitor

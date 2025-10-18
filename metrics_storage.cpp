@@ -10,6 +10,7 @@ namespace unified_monitor {
 MetricsStorage::MetricsStorage(const Config& config) : config_(config) {
     os_buffer_.reserve(10000);  // Pre-allocate buffer
     gpu_buffer_.reserve(10000);
+    gpu_pid_buffer_.reserve(10000);
 }
 
 
@@ -63,6 +64,22 @@ void MetricsStorage::addGPUMetrics(const std::vector<GPUMetrics>& metrics) {
 #endif
 }
 
+void MetricsStorage::addGPUPidMetrics(const std::vector<GPUPidMetrics>& metrics) {
+#if HAVE_CUDA
+    if (!config_.enable_gpu_pid_metrics) return;
+    if (metrics.empty()) return;
+
+    std::lock_guard<std::mutex> lock(gpu_mutex_);
+    gpu_pid_buffer_.insert(gpu_pid_buffer_.end(), metrics.begin(), metrics.end());
+
+    if (gpu_pid_buffer_.size() >= 10000) {
+        flushGPUPidData();
+    }
+#else
+    (void)metrics;
+#endif
+}
+
 void MetricsStorage::flush() {
     std::lock_guard<std::mutex> os_lock(os_mutex_);
     std::lock_guard<std::mutex> gpu_lock(gpu_mutex_);
@@ -70,6 +87,11 @@ void MetricsStorage::flush() {
     flushOSData();
 #if HAVE_CUDA
     flushGPUData();
+    if (config_.enable_gpu_pid_metrics) {
+        flushGPUPidData();
+    } else {
+        gpu_pid_buffer_.clear();
+    }
 #endif
 }
 
@@ -81,6 +103,11 @@ void MetricsStorage::flushAndClose() {
     flushOSData();
 #if HAVE_CUDA
     flushGPUData();
+    if (config_.enable_gpu_pid_metrics) {
+        flushGPUPidData();
+    } else {
+        gpu_pid_buffer_.clear();
+    }
 #endif
 
     // Close and finalize all open files
@@ -107,6 +134,18 @@ void MetricsStorage::flushAndClose() {
             std::cerr << "[MetricsStorage] Error closing GPU file: " << e.what() << std::endl;
         }
         gpu_writer_.reset();
+    }
+
+    if (config_.enable_gpu_pid_metrics && gpu_pid_writer_) {
+        try {
+            std::cout << "[MetricsStorage] Closing GPU PID file: " << gpu_pid_writer_->filename
+                      << " (" << gpu_pid_writer_->row_count << " rows)" << std::endl;
+            closeFile(*gpu_pid_writer_);
+            stats_.gpu_pid_files_written++;
+        } catch (const std::exception& e) {
+            std::cerr << "[MetricsStorage] Error closing GPU PID file: " << e.what() << std::endl;
+        }
+        gpu_pid_writer_.reset();
     }
 #endif
 }
@@ -232,6 +271,55 @@ void MetricsStorage::createGPUFile() {
 #endif
 }
 
+void MetricsStorage::createGPUPidFile() {
+#if HAVE_CUDA
+    if (!config_.enable_gpu_pid_metrics) return;
+
+    if (gpu_pid_writer_) {
+        closeFile(*gpu_pid_writer_);
+        stats_.gpu_pid_files_written++;
+    }
+
+    auto filename = generateFilename("gpu_pid_metrics");
+    auto output = orc::writeLocalFile(filename);
+    if (!output) {
+        std::cerr << "[MetricsStorage] Failed to create GPU PID file: " << filename << std::endl;
+        return;
+    }
+
+    auto schema = createGPUPidSchema();
+    if (!schema) {
+        std::cerr << "[MetricsStorage] Failed to create GPU PID schema" << std::endl;
+        return;
+    }
+
+    orc::WriterOptions options;
+    options.setCompression(orc::CompressionKind_ZSTD);
+    options.setCompressionStrategy(orc::CompressionStrategy_SPEED);
+    options.setCompressionBlockSize(64 * 1024);
+    options.setStripeSize(64 * 1024 * 1024);
+    options.setRowIndexStride(10000);
+
+    try {
+        auto writer = orc::createWriter(*schema, output.get(), options);
+
+        gpu_pid_writer_ = std::make_unique<FileWriter>();
+        gpu_pid_writer_->writer = std::move(writer);
+        gpu_pid_writer_->output = std::move(output);
+        gpu_pid_writer_->filename = filename;
+        gpu_pid_writer_->created_at = std::chrono::steady_clock::now();
+        gpu_pid_writer_->schema = std::move(schema);
+
+        stats_.last_gpu_pid_file = filename;
+        std::cout << "[MetricsStorage] Created GPU PID file: " << filename << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[MetricsStorage] Failed to create GPU PID ORC writer: " << e.what() << std::endl;
+    }
+#else
+    // GPU metrics disabled
+#endif
+}
+
 void MetricsStorage::flushGPUData() {
 #if HAVE_CUDA
     if (gpu_buffer_.empty()) return;
@@ -254,6 +342,35 @@ void MetricsStorage::flushGPUData() {
     }
 
     gpu_buffer_.clear();
+#else
+    // GPU metrics disabled
+#endif
+}
+
+void MetricsStorage::flushGPUPidData() {
+#if HAVE_CUDA
+    if (!config_.enable_gpu_pid_metrics) return;
+
+    if (gpu_pid_buffer_.empty()) return;
+
+    if (!gpu_pid_writer_ || shouldRollFile(*gpu_pid_writer_)) {
+        createGPUPidFile();
+    }
+
+    if (!gpu_pid_writer_ || !gpu_pid_writer_->writer) {
+        std::cerr << "[MetricsStorage] No valid GPU PID writer available" << std::endl;
+        return;
+    }
+
+    try {
+        writeGPUPidBatch(gpu_pid_writer_->writer.get(), gpu_pid_buffer_);
+        gpu_pid_writer_->row_count += gpu_pid_buffer_.size();
+        stats_.total_gpu_pid_samples += gpu_pid_buffer_.size();
+    } catch (const std::exception& e) {
+        std::cerr << "[MetricsStorage] Failed to write GPU PID batch: " << e.what() << std::endl;
+    }
+
+    gpu_pid_buffer_.clear();
 #else
     // GPU metrics disabled
 #endif
@@ -317,7 +434,7 @@ std::unique_ptr<orc::Type> MetricsStorage::createGPUSchema() {
         // Use the correct ORC API to build schema from string
         return std::unique_ptr<orc::Type>(
             orc::Type::buildTypeFromString(
-                "struct<timestamp:double,gpu_index:int,power_mw:int,"
+                "struct<timestamp:double,ts_unix_ns:bigint,gpu_index:int,power_mw:int,"
                 "gpu_util_percent:int,mem_util_percent:int,mem_used_bytes:bigint,"
                 "sm_clock_mhz:int,temperature_c:int>"
             )
@@ -328,6 +445,24 @@ std::unique_ptr<orc::Type> MetricsStorage::createGPUSchema() {
     }
 #else
     return nullptr; // GPU metrics disabled
+#endif
+}
+
+std::unique_ptr<orc::Type> MetricsStorage::createGPUPidSchema() {
+#if HAVE_CUDA
+    try {
+        return std::unique_ptr<orc::Type>(
+            orc::Type::buildTypeFromString(
+                "struct<timestamp:double,ts_unix_ns:bigint,gpu_index:int,pid:bigint,"
+                "sm_util_percent:int,mem_util_percent:int>"
+            )
+        );
+    } catch (const std::exception& e) {
+        std::cerr << "[MetricsStorage] Failed to create GPU PID schema: " << e.what() << std::endl;
+        return nullptr;
+    }
+#else
+    return nullptr;
 #endif
 }
 
@@ -387,19 +522,21 @@ void MetricsStorage::writeGPUBatch(orc::Writer* writer, const std::vector<GPUMet
         auto& structBatch = dynamic_cast<orc::StructVectorBatch&>(*batch);
 
         // Get column vectors
-        auto& timestampCol = dynamic_cast<orc::DoubleVectorBatch&>(*structBatch.fields[0]);
-        auto& gpuIndexCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[1]);
-        auto& powerCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[2]);
-        auto& gpuUtilCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[3]);
-        auto& memUtilCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[4]);
-        auto& memUsedCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[5]);
-        auto& smClockCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[6]);
-        auto& tempCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[7]);
+        auto& monotonicCol = dynamic_cast<orc::DoubleVectorBatch&>(*structBatch.fields[0]);
+        auto& tsUnixCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[1]);
+        auto& gpuIndexCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[2]);
+        auto& powerCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[3]);
+        auto& gpuUtilCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[4]);
+        auto& memUtilCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[5]);
+        auto& memUsedCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[6]);
+        auto& smClockCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[7]);
+        auto& tempCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[8]);
 
         // Fill data
         for (size_t i = 0; i < metrics.size(); ++i) {
             const auto& m = metrics[i];
-            timestampCol.data[i] = m.timestamp;
+            monotonicCol.data[i] = m.monotonic_ts;
+            tsUnixCol.data[i] = static_cast<int64_t>(m.ts_unix_ns);
             gpuIndexCol.data[i] = static_cast<int64_t>(m.gpu_index);
             powerCol.data[i] = static_cast<int64_t>(m.power_mw);
             gpuUtilCol.data[i] = static_cast<int64_t>(m.gpu_util_percent);
@@ -413,7 +550,7 @@ void MetricsStorage::writeGPUBatch(orc::Writer* writer, const std::vector<GPUMet
         structBatch.numElements = static_cast<uint64_t>(metrics.size());
         structBatch.hasNulls = false;
 
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 9; ++i) {
             structBatch.fields[i]->numElements = static_cast<uint64_t>(metrics.size());
             structBatch.fields[i]->hasNulls = false;
         }
@@ -425,6 +562,48 @@ void MetricsStorage::writeGPUBatch(orc::Writer* writer, const std::vector<GPUMet
     }
 #else
     (void)writer; (void)metrics; // Suppress unused parameter warnings
+#endif
+}
+
+void MetricsStorage::writeGPUPidBatch(orc::Writer* writer, const std::vector<GPUPidMetrics>& metrics) {
+#if HAVE_CUDA
+    if (metrics.empty()) return;
+
+    try {
+        auto batch = writer->createRowBatch(static_cast<uint64_t>(metrics.size()));
+        auto& structBatch = dynamic_cast<orc::StructVectorBatch&>(*batch);
+
+        auto& monotonicCol = dynamic_cast<orc::DoubleVectorBatch&>(*structBatch.fields[0]);
+        auto& tsUnixCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[1]);
+        auto& gpuIndexCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[2]);
+        auto& pidCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[3]);
+        auto& smUtilCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[4]);
+        auto& memUtilCol = dynamic_cast<orc::LongVectorBatch&>(*structBatch.fields[5]);
+
+        for (size_t i = 0; i < metrics.size(); ++i) {
+            const auto& m = metrics[i];
+            monotonicCol.data[i] = m.monotonic_ts;
+            tsUnixCol.data[i] = static_cast<int64_t>(m.ts_unix_ns);
+            gpuIndexCol.data[i] = static_cast<int64_t>(m.gpu_index);
+            pidCol.data[i] = static_cast<int64_t>(m.pid);
+            smUtilCol.data[i] = static_cast<int64_t>(m.sm_util_percent);
+            memUtilCol.data[i] = static_cast<int64_t>(m.mem_util_percent);
+        }
+
+        structBatch.numElements = static_cast<uint64_t>(metrics.size());
+        structBatch.hasNulls = false;
+        for (int i = 0; i < 6; ++i) {
+            structBatch.fields[i]->numElements = static_cast<uint64_t>(metrics.size());
+            structBatch.fields[i]->hasNulls = false;
+        }
+
+        writer->add(*batch);
+    } catch (const std::exception& e) {
+        std::cerr << "[MetricsStorage] Failed to write GPU PID batch: " << e.what() << std::endl;
+        throw;
+    }
+#else
+    (void)writer; (void)metrics;
 #endif
 }
 

@@ -15,6 +15,7 @@ namespace unified_monitor {
 // Forward declarations
 struct OSMetrics;
 struct GPUMetrics;
+struct GPUPidMetrics;
 
 // Efficient metrics storage using Apache ORC with Zstd compression
 class MetricsStorage {
@@ -25,6 +26,7 @@ public:
         std::chrono::minutes max_file_age{5}; // Roll files every 5 minutes
         bool use_zstd_compression = true;
         int zstd_compression_level = 3; // Good balance of speed vs compression
+        bool enable_gpu_pid_metrics = true;
     };
 
     // Fix: Use default constructor approach instead of default parameter with Config{}
@@ -41,6 +43,7 @@ public:
     // Add metrics samples (thread-safe)
     void addOSMetrics(const std::vector<OSMetrics>& metrics);
     void addGPUMetrics(const std::vector<GPUMetrics>& metrics);
+    void addGPUPidMetrics(const std::vector<GPUPidMetrics>& metrics);
 
     // Force flush current data to disk
     void flush();
@@ -52,10 +55,13 @@ public:
     struct StorageStats {
         size_t total_os_samples = 0;
         size_t total_gpu_samples = 0;
+        size_t total_gpu_pid_samples = 0;
         size_t os_files_written = 0;
         size_t gpu_files_written = 0;
+        size_t gpu_pid_files_written = 0;
         std::string last_os_file;
         std::string last_gpu_file;
+        std::string last_gpu_pid_file;
     };
     StorageStats getStats() const;
 
@@ -79,6 +85,9 @@ private:
     void createGPUFile();
     void flushGPUData();
     void addGPUMetricsToBatch(const std::vector<GPUMetrics>& metrics);
+    void createGPUPidFile();
+    void flushGPUPidData();
+    void addGPUPidMetricsToBatch(const std::vector<GPUPidMetrics>& metrics);
 
     // Common file management
     std::string generateFilename(const std::string& prefix, const std::string& extension = ".orc");
@@ -88,10 +97,12 @@ private:
     // ORC schema definitions
     std::unique_ptr<orc::Type> createOSSchema();
     std::unique_ptr<orc::Type> createGPUSchema();
+    std::unique_ptr<orc::Type> createGPUPidSchema();
 
     // Convert metrics to ORC batches
     void writeOSBatch(orc::Writer* writer, const std::vector<OSMetrics>& metrics);
     void writeGPUBatch(orc::Writer* writer, const std::vector<GPUMetrics>& metrics);
+    void writeGPUPidBatch(orc::Writer* writer, const std::vector<GPUPidMetrics>& metrics);
 
 private:
     Config config_;
@@ -106,6 +117,8 @@ private:
     mutable std::mutex gpu_mutex_;
     std::unique_ptr<FileWriter> gpu_writer_;
     std::vector<GPUMetrics> gpu_buffer_;
+    std::unique_ptr<FileWriter> gpu_pid_writer_;
+    std::vector<GPUPidMetrics> gpu_pid_buffer_;
 };
 
 } // namespace unified_monitor

@@ -1,5 +1,5 @@
 // simple_main.cpp - Simplified orchestrator with Apache ORC storage
-// Removes WebSocket handling and chunk tracking, focuses on process spawning and metrics collection
+// Minimal version without WebSocket/chunk tracking; runs processes and collects metrics (focus)
 //
 // Example config (config.json):
 // {
@@ -43,6 +43,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -256,9 +257,25 @@ static std::string nvml_err_str(nvmlReturn_t st) {
 GPUMetricsCollector::GPUMetricsCollector(unsigned gpu_index) : gpu_index_(gpu_index) {}
 GPUMetricsCollector::~GPUMetricsCollector() { stopMonitoring(); }
 
+void GPUMetricsCollector::setEnablePidMetrics(bool enabled) {
+    enable_pid_metrics_.store(enabled);
+    if (!enabled) {
+        std::lock_guard<std::mutex> lk(mx_);
+        pid_samples_.clear();
+        for (auto& sample : samples_) {
+            sample.pid_gpu_percent.clear();
+        }
+    }
+}
+
 void GPUMetricsCollector::startMonitoring(unsigned interval_ms, const std::vector<pid_t>& monitored_pids) {
 #if HAVE_CUDA
     stopMonitoring();
+    {
+        std::lock_guard<std::mutex> lk(mx_);
+        samples_.clear();
+        pid_samples_.clear();
+    }
     interval_ms_ = interval_ms ? interval_ms : 100;
     monitored_pids_ = monitored_pids;
     running_ = true;
@@ -271,8 +288,14 @@ void GPUMetricsCollector::startMonitoring(unsigned interval_ms, const std::vecto
 
         while (running_) {
             auto t = Clock::now();
+            const bool pid_metrics_enabled = enable_pid_metrics_.load();
+            const auto now_sys = std::chrono::system_clock::now();
+            const auto unix_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     now_sys.time_since_epoch()).count();
+
             GPUMetrics m{};
-            m.timestamp = std::chrono::duration<double>(t.time_since_epoch()).count();
+            m.monotonic_ts = std::chrono::duration<double>(t.time_since_epoch()).count();
+            m.ts_unix_ns = static_cast<int64_t>(unix_ns);
             m.gpu_index = gpu_index_;
 
             unsigned int power = 0;
@@ -294,24 +317,46 @@ void GPUMetricsCollector::startMonitoring(unsigned interval_ms, const std::vecto
             if (nvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &temp) == NVML_SUCCESS) m.temperature_c = temp;
 
             // Get per-process GPU utilization
-            const unsigned int MAX_SAMPLES = 1024;
-            std::vector<nvmlProcessUtilizationSample_t> samples(MAX_SAMPLES);
-            unsigned int n = MAX_SAMPLES;
-            st = nvmlDeviceGetProcessUtilization(dev, samples.data(), &n, 0);
-            if (st == NVML_SUCCESS) {
-                for (unsigned int i = 0; i < n; ++i) {
-                    const auto& s = samples[i];
-                    pid_t pid = static_cast<pid_t>(s.pid);
+            std::vector<GPUPidMetrics> per_pid_entries;
+            if (pid_metrics_enabled) {
+                const unsigned int MAX_SAMPLES = 1024;
+                std::vector<nvmlProcessUtilizationSample_t> samples(MAX_SAMPLES);
+                unsigned int n = MAX_SAMPLES;
+                st = nvmlDeviceGetProcessUtilization(dev, samples.data(), &n, 0);
+                if (st == NVML_SUCCESS) {
+                    per_pid_entries.reserve(n);
+                    for (unsigned int i = 0; i < n; ++i) {
+                        const auto& s = samples[i];
+                        pid_t pid = static_cast<pid_t>(s.pid);
 
-                    // Only track PIDs we're monitoring (if any specified)
-                    if (monitored_pids_.empty() ||
-                        std::find(monitored_pids_.begin(), monitored_pids_.end(), pid) != monitored_pids_.end()) {
-                        m.pid_gpu_percent[static_cast<unsigned int>(s.pid)] = s.smUtil;
+                        // Only track PIDs we're monitoring (if any specified)
+                        if (monitored_pids_.empty() ||
+                            std::find(monitored_pids_.begin(), monitored_pids_.end(), pid) != monitored_pids_.end()) {
+                            m.pid_gpu_percent[pid] = s.smUtil;
+
+                            GPUPidMetrics pid_metric{};
+                            pid_metric.monotonic_ts = m.monotonic_ts;
+                            pid_metric.ts_unix_ns = m.ts_unix_ns;
+                            pid_metric.gpu_index = m.gpu_index;
+                            pid_metric.pid = pid;
+                            pid_metric.sm_util_percent = s.smUtil;
+                            pid_metric.mem_util_percent = s.memUtil;
+                            per_pid_entries.push_back(pid_metric);
+                        }
                     }
                 }
             }
 
-            { std::lock_guard<std::mutex> lk(mx_); samples_.push_back(std::move(m)); }
+            {
+                std::lock_guard<std::mutex> lk(mx_);
+                samples_.push_back(std::move(m));
+                if (pid_metrics_enabled && !per_pid_entries.empty()) {
+                    pid_samples_.insert(pid_samples_.end(),
+                                        per_pid_entries.begin(), per_pid_entries.end());
+                } else if (!pid_metrics_enabled) {
+                    pid_samples_.clear();
+                }
+            }
 
             std::this_thread::sleep_until(t + std::chrono::milliseconds(interval_ms_));
         }
@@ -335,6 +380,11 @@ std::vector<GPUMetrics> GPUMetricsCollector::getMetrics() const {
     return samples_;
 }
 
+std::vector<GPUPidMetrics> GPUMetricsCollector::getPidMetrics() const {
+    std::lock_guard<std::mutex> lk(mx_);
+    return pid_samples_;
+}
+
 // ------------------------------ SimpleOrchestrator --------------------------
 SimpleOrchestrator::SimpleOrchestrator()
     : os_collector_(std::make_unique<OSMetricsCollector>()),
@@ -346,6 +396,7 @@ SimpleOrchestrator::~SimpleOrchestrator() { stop(); }
 
 void SimpleOrchestrator::setStorageConfig(const MetricsStorage::Config& config) {
     storage_->setStorageConfig(config);
+    enable_gpu_pid_metrics_ = config.enable_gpu_pid_metrics;
 }
 
 bool SimpleOrchestrator::run(const Config& cfg) {
@@ -355,6 +406,9 @@ bool SimpleOrchestrator::run(const Config& cfg) {
     MetricsStorage::Config storage_config = cfg.storage_config;
     storage_config.output_dir = cfg.output_dir;  // Use the output_dir from the main config
     setStorageConfig(storage_config);
+    if (!enable_gpu_pid_metrics_) {
+        std::cout << "[Config] Per-PID GPU metrics disabled; storage will skip per-process data." << std::endl;
+    }
 
     // Initialize storage
     if (!storage_->initialize()) {
@@ -454,6 +508,7 @@ void SimpleOrchestrator::startMetricsCollection(const Config& cfg) {
 
     // Start GPU metrics collection with monitored PIDs for per-process filtering
     gpu_collector_.reset(new GPUMetricsCollector(cfg.gpu_index));
+    gpu_collector_->setEnablePidMetrics(enable_gpu_pid_metrics_);
 #if HAVE_CUDA
     gpu_collector_->startMonitoring(cfg.gpu_monitor_interval_ms, monitored_pids_);
 #else
@@ -483,6 +538,13 @@ void SimpleOrchestrator::flushMetrics() {
     if (!gpu_metrics.empty()) {
         storage_->addGPUMetrics(gpu_metrics);
     }
+
+    if (enable_gpu_pid_metrics_) {
+        auto gpu_pid_metrics = gpu_collector_->getPidMetrics();
+        if (!gpu_pid_metrics.empty()) {
+            storage_->addGPUPidMetrics(gpu_pid_metrics);
+        }
+    }
 #endif
 }
 
@@ -503,11 +565,20 @@ void SimpleOrchestrator::exportSummary(const Config& config) {
     std::cout << "GPU samples collected: " << stats.total_gpu_samples << std::endl;
     std::cout << "OS files written: " << stats.os_files_written << std::endl;
     std::cout << "GPU files written: " << stats.gpu_files_written << std::endl;
+    if (enable_gpu_pid_metrics_) {
+        std::cout << "GPU PID samples collected: " << stats.total_gpu_pid_samples << std::endl;
+        std::cout << "GPU PID files written: " << stats.gpu_pid_files_written << std::endl;
+    } else {
+        std::cout << "GPU PID metrics disabled by configuration." << std::endl;
+    }
     if (!stats.last_os_file.empty()) {
         std::cout << "Last OS file: " << stats.last_os_file << std::endl;
     }
     if (!stats.last_gpu_file.empty()) {
         std::cout << "Last GPU file: " << stats.last_gpu_file << std::endl;
+    }
+    if (enable_gpu_pid_metrics_ && !stats.last_gpu_pid_file.empty()) {
+        std::cout << "Last GPU PID file: " << stats.last_gpu_pid_file << std::endl;
     }
     std::cout << "[Orchestrator] Shutdown complete." << std::endl;
 }
@@ -532,7 +603,9 @@ static void print_usage(const char* argv0) {
     "                    for process names. Takes precedence over --process-names\n"
     "  --url URL         Connect to WebSocket server at URL (e.g., wss://127.0.0.1:3001)\n"
     "                    If not provided, metrics collection starts immediately\n"
-    "  --insecure        Allow insecure WebSocket connections (accept self-signed certificates)\n";
+    "  --insecure        Allow insecure WebSocket connections (accept self-signed certificates)\n"
+    "  --disable-gpu-pid-metrics  Skip per-process GPU utilization capture and storage\n"
+    "  --enable-gpu-pid-metrics   Force-enable per-process GPU metrics (default)\n";
 }
 
 // Helper function to split comma-separated string
@@ -598,6 +671,14 @@ int main(int argc, char** argv) {
             // Note: This flag is parsed but the insecure handling is done in the WebSocketListener
             // SSL verification is already disabled in the WebSocketListener constructor
             std::cout << "[Config] Insecure mode enabled (self-signed certificates accepted)" << std::endl;
+        }
+        else if (a == "--disable-gpu-pid-metrics") {
+            cfg.storage_config.enable_gpu_pid_metrics = false;
+            std::cout << "[Config] Disabling per-process GPU metrics." << std::endl;
+        }
+        else if (a == "--enable-gpu-pid-metrics") {
+            cfg.storage_config.enable_gpu_pid_metrics = true;
+            std::cout << "[Config] Enabling per-process GPU metrics." << std::endl;
         }
         else if (a == "--help" || a == "-h") {
             print_usage(argv[0]);
