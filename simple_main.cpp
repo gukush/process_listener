@@ -1,61 +1,16 @@
-// simple_main.cpp - Simplified orchestrator with Apache ORC storage
-// Minimal version without WebSocket/chunk tracking; runs processes and collects metrics (focus)
-//
-// Example config (config.json):
-// {
-//   "mode": "browser+cpp",                        // or "cpp-only"
-//   "server": "wss://127.0.0.1:3001",
-//
-//   "browser": {
-//     "enabled": true,
-//     "argv": ["/usr/bin/google-chrome", "--new-window", "http://localhost:3000"],
-//     "cwd": "/",
-//     "env": { "DISPLAY": ":0" },
-//     "shell": false
-//   },
-//
-//   "cpp_client": {
-//     "enabled": true,
-//     "argv": ["./cpp_client"],
-//     "cwd": "/home/user/project",
-//     "env": { },
-//     "shell": false
-//   },
-//
-//   "gpu_index": 0,
-//   "os_interval_ms": 100,
-//   "gpu_interval_ms": 50,
-//   "duration_sec": 0,
-//   "output_dir": "./metrics",
-//   "storage": {
-//     "max_rows_per_file": 100000,
-//     "max_file_age_minutes": 5,
-//     "use_zstd_compression": true,
-//     "zstd_compression_level": 3
-//   }
-// }
+#include "simple_orchestrator.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
-#include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <algorithm>
-#include <map>
-#include <mutex>
-#include <optional>
-#include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
-#include <vector>
-#include <unistd.h>     // fork, execvp, chdir
-#include <stdlib.h>     // setenv
-
-#include <nlohmann/json.hpp>
-#include <sstream>
+#include <utility>
+#include <unistd.h>
 
 #if HAVE_CUDA
   #if __has_include(<nvml.h>)
@@ -65,634 +20,322 @@
   #endif
 #endif
 
-#include "simple_orchestrator.hpp"
+namespace {
 
-using json = nlohmann::json;
+std::atomic<bool> g_interrupted{false};
+
+void handleSignal(int) {
+    g_interrupted = true;
+}
+
+int64_t unixNowNs() {
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+std::string hostnameLabel() {
+    char hostname[256] = {};
+    if (gethostname(hostname, sizeof(hostname) - 1) == 0 && hostname[0] != '\0') {
+        return hostname;
+    }
+    return "unknown";
+}
+
+#if HAVE_CUDA
+std::string nvmlError(nvmlReturn_t status) {
+    const char* text = nvmlErrorString(status);
+    return text ? text : "NVML error";
+}
+#endif
+
+} // namespace
 
 namespace unified_monitor {
 
-// --------------------------- signals -----------------------------------------
-static std::atomic<bool> g_interrupted = false;
-static void handle_signal(int) {
-    g_interrupted = true;
-    std::cout << "\n[Signal] Interrupt received, shutting down gracefully..." << std::endl;
-}
+SimpleOrchestrator::SimpleOrchestrator() = default;
 
-// --------------------------- process scanning -----------------------------------
-std::string SimpleOrchestrator::getProcessCmdline(pid_t pid) {
-    std::string cmdline;
-    std::ifstream cmdline_file("/proc/" + std::to_string(pid) + "/cmdline");
-    if (cmdline_file.is_open()) {
-        std::getline(cmdline_file, cmdline);
-        // Replace null bytes with spaces for easier parsing
-        std::replace(cmdline.begin(), cmdline.end(), '\0', ' ');
-        // Remove trailing whitespace
-        cmdline.erase(cmdline.find_last_not_of(" \t\n\r\f\v") + 1);
-    }
-    return cmdline;
-}
-
-bool SimpleOrchestrator::hasChromeDataDir(pid_t pid, const std::string& data_dir) {
-    if (data_dir.empty()) {
-        return true; // No filtering if data_dir not specified
-    }
-
-    std::string cmdline = getProcessCmdline(pid);
-    if (cmdline.empty()) {
-        return false;
-    }
-
-    // Look for --user-data-dir argument in the command line
-    std::string search_pattern = "--user-data-dir=" + data_dir;
-    return cmdline.find(search_pattern) != std::string::npos;
-}
-
-std::vector<pid_t> SimpleOrchestrator::getPidsByName(const std::string& process_name) {
-    std::vector<pid_t> pids;
-
-    // Read /proc directory to find processes
-    std::filesystem::path proc_path("/proc");
-    if (!std::filesystem::exists(proc_path)) {
-        std::cerr << "[Scan] /proc directory not found" << std::endl;
-        return pids;
-    }
-
-    try {
-        for (const auto& entry : std::filesystem::directory_iterator(proc_path)) {
-            if (!entry.is_directory()) continue;
-
-            std::string dir_name = entry.path().filename().string();
-
-            // Check if directory name is a number (PID)
-            if (std::all_of(dir_name.begin(), dir_name.end(), ::isdigit)) {
-                pid_t pid = static_cast<pid_t>(std::stoi(dir_name));
-
-                // Read process name from /proc/PID/comm
-                std::ifstream comm_file(entry.path() / "comm");
-                if (comm_file.is_open()) {
-                    std::string comm;
-                    if (std::getline(comm_file, comm)) {
-                        // Remove trailing newline if present
-                        if (!comm.empty() && comm.back() == '\n') {
-                            comm.pop_back();
-                        }
-
-                        if (comm == process_name) {
-                            pids.push_back(pid);
-                            std::cout << "[Scan] Found " << process_name << " with PID " << pid << std::endl;
-                        }
-                    }
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "[Scan] Error scanning processes: " << e.what() << std::endl;
-    }
-
-    return pids;
-}
-
-std::vector<pid_t> SimpleOrchestrator::scanForProcesses(const std::vector<std::string>& process_names) {
-    std::vector<pid_t> all_pids;
-
-    for (const auto& name : process_names) {
-        auto pids = getPidsByName(name);
-        all_pids.insert(all_pids.end(), pids.begin(), pids.end());
-    }
-
-    if (all_pids.empty()) {
-        std::cout << "[Scan] No target processes found. Make sure "
-                  << "google-chrome and/or native_client are running." << std::endl;
-    } else {
-        std::cout << "[Scan] Found " << all_pids.size() << " target processes to monitor" << std::endl;
-    }
-
-    return all_pids;
-}
-
-std::vector<pid_t> SimpleOrchestrator::scanForProcesses(const std::vector<std::string>& process_names, const std::string& chrome_data_dir) {
-    std::vector<pid_t> all_pids;
-
-    for (const auto& name : process_names) {
-        auto pids = getPidsByName(name);
-
-        // Apply Chrome data directory filtering if specified
-        if (name == "chrome" && !chrome_data_dir.empty()) {
-            std::vector<pid_t> filtered_pids;
-            for (pid_t pid : pids) {
-                if (hasChromeDataDir(pid, chrome_data_dir)) {
-                    filtered_pids.push_back(pid);
-                    std::string cmdline = getProcessCmdline(pid);
-                    std::cout << "[Scan] Chrome PID " << pid << " matches data dir filter: " << cmdline << std::endl;
-                }
-            }
-            pids = filtered_pids;
-        }
-
-        all_pids.insert(all_pids.end(), pids.begin(), pids.end());
-    }
-
-    if (all_pids.empty()) {
-        std::cout << "[Scan] No target processes found. Make sure "
-                  << "google-chrome and/or native_client are running." << std::endl;
-        if (!chrome_data_dir.empty()) {
-            std::cout << "[Scan] Chrome data directory filter: " << chrome_data_dir << std::endl;
-        }
-    } else {
-        std::cout << "[Scan] Found " << all_pids.size() << " target processes to monitor" << std::endl;
-    }
-
-    return all_pids;
-}
-
-// --------- OSMetricsCollector thread orchestration ----------
-OSMetricsCollector::OSMetricsCollector() = default;
-OSMetricsCollector::~OSMetricsCollector() { stopMonitoring(); }
-
-void OSMetricsCollector::startMonitoring(const std::vector<pid_t>& pids, unsigned interval_ms) {
-    stopMonitoring();
-    monitored_pids_ = pids;
-    interval_ms_ = interval_ms ? interval_ms : 200;
-    running_ = true;
-    monitor_thread_ = std::thread([this]() {
-        while (running_) {
-            auto now = Clock::now();
-            std::vector<OSMetrics> batch;
-            batch.reserve(monitored_pids_.size());
-            for (pid_t pid : monitored_pids_) {
-                if (pid <= 0) continue;
-                try {
-                    auto m = collectForPid(pid);
-                    batch.push_back(m);
-                } catch (...) {}
-            }
-            if (!batch.empty()) {
-                std::lock_guard<std::mutex> lock(metrics_mutex_);
-                metrics_.insert(metrics_.end(), batch.begin(), batch.end());
-            }
-            std::this_thread::sleep_until(now + std::chrono::milliseconds(interval_ms_));
-        }
-    });
-}
-
-void OSMetricsCollector::stopMonitoring() {
-    if (!running_) return;
-    running_ = false;
-    if (monitor_thread_.joinable()) monitor_thread_.join();
-}
-
-std::vector<OSMetrics> OSMetricsCollector::getMetrics() const {
-    std::lock_guard<std::mutex> lock(metrics_mutex_);
-    return metrics_;
-}
-
-// ------------------------ GPUMetricsCollector impl ---------------------------
-#if HAVE_CUDA
-static std::string nvml_err_str(nvmlReturn_t st) {
-    const char* s = nvmlErrorString(st);
-    return s ? std::string(s) : "NVML_ERROR";
-}
-#endif
-
-GPUMetricsCollector::GPUMetricsCollector(unsigned gpu_index) : gpu_index_(gpu_index) {}
-GPUMetricsCollector::~GPUMetricsCollector() { stopMonitoring(); }
-
-void GPUMetricsCollector::setEnablePidMetrics(bool enabled) {
-    enable_pid_metrics_.store(enabled);
-    if (!enabled) {
-        std::lock_guard<std::mutex> lk(mx_);
-        pid_samples_.clear();
-        for (auto& sample : samples_) {
-            sample.pid_gpu_percent.clear();
-        }
-    }
-}
-
-void GPUMetricsCollector::startMonitoring(unsigned interval_ms, const std::vector<pid_t>& monitored_pids) {
-#if HAVE_CUDA
-    stopMonitoring();
-    {
-        std::lock_guard<std::mutex> lk(mx_);
-        samples_.clear();
-        pid_samples_.clear();
-    }
-    interval_ms_ = interval_ms ? interval_ms : 100;
-    monitored_pids_ = monitored_pids;
-    running_ = true;
-    worker_ = std::thread([this]() {
-        nvmlReturn_t st = nvmlInit_v2();
-        if (st != NVML_SUCCESS) { std::cerr << "[NVML] init failed: " << nvml_err_str(st) << "\n"; running_ = false; return; }
-        nvmlDevice_t dev{};
-        st = nvmlDeviceGetHandleByIndex_v2(gpu_index_, &dev);
-        if (st != NVML_SUCCESS) { std::cerr << "[NVML] device " << gpu_index_ << " error: " << nvml_err_str(st) << "\n"; nvmlShutdown(); running_ = false; return; }
-
-        while (running_) {
-            auto t = Clock::now();
-            const bool pid_metrics_enabled = enable_pid_metrics_.load();
-            const auto now_sys = std::chrono::system_clock::now();
-            const auto unix_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                     now_sys.time_since_epoch()).count();
-
-            GPUMetrics m{};
-            m.monotonic_ts = std::chrono::duration<double>(t.time_since_epoch()).count();
-            m.ts_unix_ns = static_cast<int64_t>(unix_ns);
-            m.gpu_index = gpu_index_;
-
-            unsigned int power = 0;
-            if (nvmlDeviceGetPowerUsage(dev, &power) == NVML_SUCCESS) m.power_mw = power;
-
-            nvmlUtilization_t util{};
-            if (nvmlDeviceGetUtilizationRates(dev, &util) == NVML_SUCCESS) {
-                m.gpu_util_percent = util.gpu;
-                m.mem_util_percent = util.memory;
-            }
-
-            nvmlMemory_t mem{};
-            if (nvmlDeviceGetMemoryInfo(dev, &mem) == NVML_SUCCESS) m.mem_used_bytes = mem.used;
-
-            unsigned int sm = 0;
-            if (nvmlDeviceGetClockInfo(dev, NVML_CLOCK_SM, &sm) == NVML_SUCCESS) m.sm_clock_mhz = sm;
-
-            unsigned int temp = 0;
-            if (nvmlDeviceGetTemperature(dev, NVML_TEMPERATURE_GPU, &temp) == NVML_SUCCESS) m.temperature_c = temp;
-
-            // Get per-process GPU utilization
-            std::vector<GPUPidMetrics> per_pid_entries;
-            if (pid_metrics_enabled) {
-                const unsigned int MAX_SAMPLES = 1024;
-                std::vector<nvmlProcessUtilizationSample_t> samples(MAX_SAMPLES);
-                unsigned int n = MAX_SAMPLES;
-                st = nvmlDeviceGetProcessUtilization(dev, samples.data(), &n, 0);
-                if (st == NVML_SUCCESS) {
-                    per_pid_entries.reserve(n);
-                    for (unsigned int i = 0; i < n; ++i) {
-                        const auto& s = samples[i];
-                        pid_t pid = static_cast<pid_t>(s.pid);
-
-                        // Only track PIDs we're monitoring (if any specified)
-                        if (monitored_pids_.empty() ||
-                            std::find(monitored_pids_.begin(), monitored_pids_.end(), pid) != monitored_pids_.end()) {
-                            m.pid_gpu_percent[pid] = s.smUtil;
-
-                            GPUPidMetrics pid_metric{};
-                            pid_metric.monotonic_ts = m.monotonic_ts;
-                            pid_metric.ts_unix_ns = m.ts_unix_ns;
-                            pid_metric.gpu_index = m.gpu_index;
-                            pid_metric.pid = pid;
-                            pid_metric.sm_util_percent = s.smUtil;
-                            pid_metric.mem_util_percent = s.memUtil;
-                            per_pid_entries.push_back(pid_metric);
-                        }
-                    }
-                }
-            }
-
-            {
-                std::lock_guard<std::mutex> lk(mx_);
-                samples_.push_back(std::move(m));
-                if (pid_metrics_enabled && !per_pid_entries.empty()) {
-                    pid_samples_.insert(pid_samples_.end(),
-                                        per_pid_entries.begin(), per_pid_entries.end());
-                } else if (!pid_metrics_enabled) {
-                    pid_samples_.clear();
-                }
-            }
-
-            std::this_thread::sleep_until(t + std::chrono::milliseconds(interval_ms_));
-        }
-
-        nvmlShutdown();
-    });
-#else
-    (void)interval_ms;
-    running_ = false; // disabled
-#endif
-}
-
-void GPUMetricsCollector::stopMonitoring() {
-    if (!running_) return;
-    running_ = false;
-    if (worker_.joinable()) worker_.join();
-}
-
-std::vector<GPUMetrics> GPUMetricsCollector::getMetrics() const {
-    std::lock_guard<std::mutex> lk(mx_);
-    return samples_;
-}
-
-std::vector<GPUPidMetrics> GPUMetricsCollector::getPidMetrics() const {
-    std::lock_guard<std::mutex> lk(mx_);
-    return pid_samples_;
-}
-
-// ------------------------------ SimpleOrchestrator --------------------------
-SimpleOrchestrator::SimpleOrchestrator()
-    : os_collector_(std::make_unique<OSMetricsCollector>()),
-      gpu_collector_(std::make_unique<GPUMetricsCollector>(0)),
-      storage_(std::make_unique<MetricsStorage>()),
-      websocket_listener_(std::make_unique<WebSocketListener>()) {}
-
-SimpleOrchestrator::~SimpleOrchestrator() { stop(); }
-
-void SimpleOrchestrator::setStorageConfig(const MetricsStorage::Config& config) {
-    storage_->setStorageConfig(config);
-    enable_gpu_pid_metrics_ = config.enable_gpu_pid_metrics;
-}
-
-bool SimpleOrchestrator::run(const Config& cfg) {
-    running_ = true;
-
-    // Configure storage with the provided config
-    MetricsStorage::Config storage_config = cfg.storage_config;
-    storage_config.output_dir = cfg.output_dir;  // Use the output_dir from the main config
-    setStorageConfig(storage_config);
-    if (!enable_gpu_pid_metrics_) {
-        std::cout << "[Config] Per-PID GPU metrics disabled; storage will skip per-process data." << std::endl;
-    }
-
-    // Initialize storage
-    if (!storage_->initialize()) {
-        std::cerr << "[Orchestrator] Failed to initialize storage" << std::endl;
-        return false;
-    }
-
-    // Scan for target processes or use specific PID
-    if (cfg.target_pid > 0) {
-        // Monitor specific PID
-        monitored_pids_ = {cfg.target_pid};
-        std::cout << "[Orchestrator] Monitoring specific PID: " << cfg.target_pid << std::endl;
-
-        // Verify the PID exists
-        std::ifstream proc_file("/proc/" + std::to_string(cfg.target_pid) + "/stat");
-        if (!proc_file.is_open()) {
-            std::cerr << "[Orchestrator] PID " << cfg.target_pid << " does not exist or is not accessible" << std::endl;
-            return false;
-        }
-        proc_file.close();
-    } else {
-        // Scan for target processes by name
-        monitored_pids_ = scanForProcesses(cfg.target_process_names, cfg.chrome_data_dir);
-
-        if (monitored_pids_.empty()) {
-            std::cerr << "[Orchestrator] No target processes found to monitor" << std::endl;
-            return false;
-        }
-    }
-
-    // Set up websocket connection if URL is provided
-    if (!cfg.websocket_url.empty()) {
-        setupWebSocket(cfg);
-    } else {
-        // If no websocket URL provided, start metrics collection immediately
-        std::cout << "[Orchestrator] No WebSocket URL provided, starting metrics collection immediately" << std::endl;
-        startMetricsCollection(cfg);
-        metrics_collecting_ = true;
-    }
-
-    // Wait loop
-    auto t0 = Clock::now();
-    while (running_) {
-        if (g_interrupted) break;
-        if (cfg.duration_sec > 0 && Clock::now() - t0 > std::chrono::seconds(cfg.duration_sec)) break;
-
-        // Periodically flush metrics to storage
-        if (metrics_collecting_) {
-            flushMetrics();
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    }
-
-    // Stop collectors and export
-    stopMetricsCollection();
-    exportSummary(cfg);
-
-    return true;
+SimpleOrchestrator::~SimpleOrchestrator() {
+    stop();
 }
 
 void SimpleOrchestrator::stop() {
     running_ = false;
+    sampling_ = false;
     if (websocket_listener_) {
         websocket_listener_->disconnect();
+    }
+    if (storage_) {
+        storage_->flushAndClose();
     }
 }
 
 void SimpleOrchestrator::setupWebSocket(const Config& cfg) {
-    // Set up websocket callbacks
-    websocket_listener_->onStartMetrics = [this, &cfg]() {
-        std::cout << "[Orchestrator] WebSocket: Starting metrics collection..." << std::endl;
-        startMetricsCollection(cfg);
-        metrics_collecting_ = true;
+    websocket_listener_ = std::make_unique<WebSocketListener>();
+    websocket_listener_->onStartMetrics = [this]() {
+        sampling_ = true;
+        std::cout << "[Monitor] metrics:start received, sampling enabled" << std::endl;
     };
-
     websocket_listener_->onStopMetrics = [this]() {
-        std::cout << "[Orchestrator] WebSocket: Stopping metrics collection..." << std::endl;
-        stopMetricsCollection();
-        metrics_collecting_ = false;
+        sampling_ = false;
+        if (storage_) storage_->flush();
+        std::cout << "[Monitor] metrics:stop received, sampling paused" << std::endl;
     };
 
-    // Connect to websocket server
     if (!websocket_listener_->connect(cfg.websocket_url)) {
-        std::cerr << "[Orchestrator] Failed to connect to websocket server. Starting metrics collection immediately." << std::endl;
-        startMetricsCollection(cfg);
-        metrics_collecting_ = true;
+        throw std::runtime_error("failed to connect WebSocket listener");
+    }
+}
+
+GpuPowerSample SimpleOrchestrator::sampleGpu(unsigned gpu_index) {
+    GpuPowerSample sample{};
+    sample.gpu_index = gpu_index;
+
+#if HAVE_CUDA
+    static bool initialized = false;
+    static bool available = false;
+    static unsigned current_index = 0;
+    static nvmlDevice_t device{};
+
+    if (!initialized || current_index != gpu_index) {
+        if (initialized) {
+            nvmlShutdown();
+        }
+        initialized = true;
+        current_index = gpu_index;
+        available = false;
+
+        nvmlReturn_t status = nvmlInit_v2();
+        if (status != NVML_SUCCESS) {
+            std::cerr << "[NVML] init failed: " << nvmlError(status) << std::endl;
+            return sample;
+        }
+        status = nvmlDeviceGetHandleByIndex_v2(gpu_index, &device);
+        if (status != NVML_SUCCESS) {
+            std::cerr << "[NVML] device " << gpu_index << " unavailable: "
+                      << nvmlError(status) << std::endl;
+            nvmlShutdown();
+            return sample;
+        }
+        available = true;
+        std::cout << "[NVML] Sampling GPU " << gpu_index << " power usage" << std::endl;
+    }
+
+    if (!available) return sample;
+
+    unsigned int power = 0;
+    if (nvmlDeviceGetPowerUsage(device, &power) == NVML_SUCCESS) {
+        sample.power_mw = static_cast<int64_t>(power);
+    }
+
+#endif
+
+    return sample;
+}
+
+void SimpleOrchestrator::sampleOnce(const Config& cfg, uint64_t sample_index) {
+    const int64_t ts_unix_ns = unixNowNs();
+    const auto gpu = sampleGpu(cfg.gpu_index);
+    auto energy = rapl_collector_ ? rapl_collector_->collect() : std::vector<EnergyMetrics>{};
+
+    std::vector<UnifiedMetricSample> rows;
+    if (energy.empty()) {
+        UnifiedMetricSample row{};
+        row.ts_unix_ns = ts_unix_ns;
+        row.sample_index = sample_index;
+        row.label = cfg.label;
+        row.gpu_index = gpu.gpu_index;
+        row.gpu_power_mw = gpu.power_mw;
+        row.rapl_zone_index = -1;
+        row.rapl_zone_name = "unavailable";
+        rows.push_back(std::move(row));
     } else {
-        std::cout << "[Orchestrator] Connected to websocket server. Waiting for start signal..." << std::endl;
-    }
-}
-
-void SimpleOrchestrator::startMetricsCollection(const Config& cfg) {
-    std::cout << "[Orchestrator] ===== MEASURING STARTS =====" << std::endl;
-
-    // Start OS metrics collection with scanned PIDs
-    os_collector_->startMonitoring(monitored_pids_, cfg.os_monitor_interval_ms);
-
-    // Start GPU metrics collection with monitored PIDs for per-process filtering
-    gpu_collector_.reset(new GPUMetricsCollector(cfg.gpu_index));
-    gpu_collector_->setEnablePidMetrics(enable_gpu_pid_metrics_);
-#if HAVE_CUDA
-    gpu_collector_->startMonitoring(cfg.gpu_monitor_interval_ms, monitored_pids_);
-#else
-    std::cout << "[GPU] HAVE_CUDA=0 -> GPU/NVML metrics disabled." << std::endl;
-#endif
-}
-
-void SimpleOrchestrator::stopMetricsCollection() {
-    std::cout << "[Orchestrator] ===== MEASURING ENDS =====" << std::endl;
-
-    os_collector_->stopMonitoring();
-#if HAVE_CUDA
-    gpu_collector_->stopMonitoring();
-#endif
-}
-
-void SimpleOrchestrator::flushMetrics() {
-    // Get and store OS metrics
-    auto os_metrics = os_collector_->getMetrics();
-    if (!os_metrics.empty()) {
-        storage_->addOSMetrics(os_metrics);
-    }
-
-    // Get and store GPU metrics
-#if HAVE_CUDA
-    auto gpu_metrics = gpu_collector_->getMetrics();
-    if (!gpu_metrics.empty()) {
-        storage_->addGPUMetrics(gpu_metrics);
-    }
-
-    if (enable_gpu_pid_metrics_) {
-        auto gpu_pid_metrics = gpu_collector_->getPidMetrics();
-        if (!gpu_pid_metrics.empty()) {
-            storage_->addGPUPidMetrics(gpu_pid_metrics);
+        rows.reserve(energy.size());
+        for (const auto& e : energy) {
+            UnifiedMetricSample row{};
+            row.ts_unix_ns = ts_unix_ns;
+            row.sample_index = sample_index;
+            row.label = cfg.label;
+            row.gpu_index = gpu.gpu_index;
+            row.gpu_power_mw = gpu.power_mw;
+            row.rapl_zone_index = e.zone_index;
+            row.rapl_zone_name = e.zone_name;
+            row.cpu_energy_delta_uj = e.energy_delta_uj;
+            row.cpu_energy_total_uj = e.total_energy_uj;
+            rows.push_back(std::move(row));
         }
     }
-#endif
+
+    storage_->addSamples(rows);
 }
 
-void SimpleOrchestrator::exportSummary(const Config& config) {
-    std::cout << "[Orchestrator] Finalizing metrics storage..." << std::endl;
+bool SimpleOrchestrator::run(const Config& input_cfg) {
+    Config cfg = input_cfg;
+    if (cfg.label.empty()) cfg.label = hostnameLabel();
+    if (cfg.interval_ms == 0) cfg.interval_ms = 100;
 
-    // Flush any remaining metrics first
-    flushMetrics();
+    MetricsStorage::Config storage_cfg = cfg.storage_config;
+    storage_cfg.output_dir = cfg.output_dir;
+    storage_cfg.label = cfg.label;
 
-    // CRITICAL FIX: Use flushAndClose() instead of flush()
-    // to ensure ORC files are properly closed with footer/metadata
-    storage_->flushAndClose();
+    storage_ = std::make_unique<MetricsStorage>(storage_cfg);
+    if (!storage_->initialize()) {
+        return false;
+    }
 
-    // Print summary
-    auto stats = storage_->getStats();
-    std::cout << "\n[Metrics Summary]" << std::endl;
-    std::cout << "OS samples collected: " << stats.total_os_samples << std::endl;
-    std::cout << "GPU samples collected: " << stats.total_gpu_samples << std::endl;
-    std::cout << "OS files written: " << stats.os_files_written << std::endl;
-    std::cout << "GPU files written: " << stats.gpu_files_written << std::endl;
-    if (enable_gpu_pid_metrics_) {
-        std::cout << "GPU PID samples collected: " << stats.total_gpu_pid_samples << std::endl;
-        std::cout << "GPU PID files written: " << stats.gpu_pid_files_written << std::endl;
+    rapl_collector_ = std::make_unique<RAPLEnergyCollector>();
+    if (!rapl_collector_->isAvailable()) {
+        std::cerr << "[RAPL] No readable CPU energy zones; rows will mark RAPL unavailable" << std::endl;
+    }
+
+    running_ = true;
+    sampling_ = !cfg.wait_for_start;
+
+    if (cfg.wait_for_start) {
+        if (cfg.websocket_url.empty()) {
+            std::cerr << "[Monitor] --wait-for-start requires --url" << std::endl;
+            return false;
+        }
+        try {
+            setupWebSocket(cfg);
+        } catch (const std::exception& e) {
+            std::cerr << "[Monitor] WebSocket setup failed: " << e.what() << std::endl;
+            return false;
+        }
+        std::cout << "[Monitor] Waiting for metrics:start" << std::endl;
     } else {
-        std::cout << "GPU PID metrics disabled by configuration." << std::endl;
+        std::cout << "[Monitor] Sampling immediately every " << cfg.interval_ms << " ms" << std::endl;
     }
-    if (!stats.last_os_file.empty()) {
-        std::cout << "Last OS file: " << stats.last_os_file << std::endl;
-    }
-    if (!stats.last_gpu_file.empty()) {
-        std::cout << "Last GPU file: " << stats.last_gpu_file << std::endl;
-    }
-    if (enable_gpu_pid_metrics_ && !stats.last_gpu_pid_file.empty()) {
-        std::cout << "Last GPU PID file: " << stats.last_gpu_pid_file << std::endl;
-    }
-    std::cout << "[Orchestrator] Shutdown complete." << std::endl;
-}
 
-// ----------------------------------- CLI & Config ----------------------------
-static void print_usage(const char* argv0) {
-    std::cerr
-    <<"Usage:\n"
-    "  " << argv0 << " [--gpu-index N] [--os-interval MS] [--gpu-interval MS]\n"
-    "               [--duration SEC] [--out-dir DIR]\n"
-    "               [--process-names NAME1,NAME2,...]\n"
-    "               [--data-dir DIR] [--pid PID]\n"
-    "               [--url URL] [--insecure]\n"
-    "\n"
-    "This tool scans for running processes named 'chrome' and 'native_client'\n"
-    "by default and monitors their OS and GPU metrics.\n"
-    "\n"
-    "Options:\n"
-    "  --data-dir DIR    Filter Chrome processes by --user-data-dir argument\n"
-    "                    Only monitor Chrome processes that use this data directory\n"
-    "  --pid PID         Monitor a specific process by its PID instead of scanning\n"
-    "                    for process names. Takes precedence over --process-names\n"
-    "  --url URL         Connect to WebSocket server at URL (e.g., wss://127.0.0.1:3001)\n"
-    "                    If not provided, metrics collection starts immediately\n"
-    "  --insecure        Allow insecure WebSocket connections (accept self-signed certificates)\n"
-    "  --disable-gpu-pid-metrics  Skip per-process GPU utilization capture and storage\n"
-    "  --enable-gpu-pid-metrics   Force-enable per-process GPU metrics (default)\n";
-}
+    const auto started = std::chrono::steady_clock::now();
+    auto next_tick = started;
+    uint64_t sample_index = 0;
 
-// Helper function to split comma-separated string
-static std::vector<std::string> split_string(const std::string& str, char delimiter) {
-    std::vector<std::string> result;
-    std::stringstream ss(str);
-    std::string item;
-    while (std::getline(ss, item, delimiter)) {
-        if (!item.empty()) {
-            result.push_back(item);
+    while (running_ && !::g_interrupted.load()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (cfg.duration_sec > 0 && now - started >= std::chrono::seconds(cfg.duration_sec)) {
+            break;
+        }
+
+        if (sampling_.load()) {
+            sampleOnce(cfg, sample_index++);
+        }
+
+        next_tick += std::chrono::milliseconds(cfg.interval_ms);
+        std::this_thread::sleep_until(next_tick);
+        if (std::chrono::steady_clock::now() > next_tick + std::chrono::milliseconds(cfg.interval_ms)) {
+            next_tick = std::chrono::steady_clock::now();
         }
     }
-    return result;
+
+    stop();
+    return true;
 }
 
 } // namespace unified_monitor
 
+namespace {
+
+void usage(const char* argv0) {
+    std::cout
+        << "Usage: " << argv0 << " [options]\n"
+        << "  --label LABEL           Machine/run label; defaults to hostname\n"
+        << "  --out-dir DIR           Output directory (default: ./metrics)\n"
+        << "  --gpu-index N           NVML GPU index (default: 0)\n"
+        << "  --interval MS           Sampling interval (default: 100)\n"
+        << "  --duration SEC          Stop after SEC seconds (default: until signal)\n"
+        << "  --wait-for-start        Wait for WebSocket metrics:start before sampling\n"
+        << "  --url URL               WebSocket URL used with --wait-for-start\n"
+        << "  --no-zstd               Disable ORC Zstd compression\n"
+        << "  --help                  Show this help\n";
+}
+
+bool parseUnsigned(const std::string& text, unsigned& out) {
+    try {
+        size_t pos = 0;
+        unsigned long value = std::stoul(text, &pos, 10);
+        if (pos != text.size()) return false;
+        out = static_cast<unsigned>(value);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool parseInt(const std::string& text, int& out) {
+    try {
+        size_t pos = 0;
+        int value = std::stoi(text, &pos, 10);
+        if (pos != text.size()) return false;
+        out = value;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+} // namespace
+
 int main(int argc, char** argv) {
-    using namespace unified_monitor;
+    std::signal(SIGINT, handleSignal);
+    std::signal(SIGTERM, handleSignal);
 
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
+    unified_monitor::SimpleOrchestrator::Config cfg;
+    cfg.interval_ms = 100;
 
-    SimpleOrchestrator::Config cfg;
-
-    // -------------------------- CLI parse --------------------------
     for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto need = [&](const char* name) {
-            if (i + 1 >= argc) { std::cerr << name << " requires value\n"; print_usage(argv[0]); std::exit(2); }
-            return std::string(argv[++i]);
+        std::string arg = argv[i];
+        auto requireValue = [&](const char* name) -> std::string {
+            if (i + 1 >= argc) {
+                throw std::runtime_error(std::string("missing value for ") + name);
+            }
+            return argv[++i];
         };
 
-        if (a == "--gpu-index") {
-            cfg.gpu_index = static_cast<unsigned>(std::stoul(need("--gpu-index")));
-        }
-        else if (a == "--os-interval") {
-            cfg.os_monitor_interval_ms = static_cast<unsigned>(std::stoul(need("--os-interval")));
-        }
-        else if (a == "--gpu-interval") {
-            cfg.gpu_monitor_interval_ms = static_cast<unsigned>(std::stoul(need("--gpu-interval")));
-        }
-        else if (a == "--duration") {
-            cfg.duration_sec = std::stoi(need("--duration"));
-        }
-        else if (a == "--out-dir") {
-            cfg.output_dir = need("--out-dir");
-        }
-        else if (a == "--process-names") {
-            cfg.target_process_names = split_string(need("--process-names"), ',');
-        }
-        else if (a == "--data-dir") {
-            cfg.chrome_data_dir = need("--data-dir");
-        }
-        else if (a == "--pid") {
-            cfg.target_pid = static_cast<pid_t>(std::stoi(need("--pid")));
-        }
-        else if (a == "--url") {
-            cfg.websocket_url = need("--url");
-            std::cout << "[Config] WebSocket URL: " << cfg.websocket_url << std::endl;
-        }
-        else if (a == "--insecure") {
-            // Note: This flag is parsed but the insecure handling is done in the WebSocketListener
-            // SSL verification is already disabled in the WebSocketListener constructor
-            std::cout << "[Config] Insecure mode enabled (self-signed certificates accepted)" << std::endl;
-        }
-        else if (a == "--disable-gpu-pid-metrics") {
-            cfg.storage_config.enable_gpu_pid_metrics = false;
-            std::cout << "[Config] Disabling per-process GPU metrics." << std::endl;
-        }
-        else if (a == "--enable-gpu-pid-metrics") {
-            cfg.storage_config.enable_gpu_pid_metrics = true;
-            std::cout << "[Config] Enabling per-process GPU metrics." << std::endl;
-        }
-        else if (a == "--help" || a == "-h") {
-            print_usage(argv[0]);
-            return 0;
-        }
-        else {
-            std::cerr << "Unknown arg: " << a << "\n";
-            print_usage(argv[0]);
+        try {
+            if (arg == "--help" || arg == "-h") {
+                usage(argv[0]);
+                return 0;
+            } else if (arg == "--label") {
+                cfg.label = requireValue("--label");
+            } else if (arg == "--out-dir") {
+                cfg.output_dir = requireValue("--out-dir");
+            } else if (arg == "--gpu-index") {
+                unsigned value = 0;
+                if (!parseUnsigned(requireValue("--gpu-index"), value)) {
+                    throw std::runtime_error("invalid --gpu-index");
+                }
+                cfg.gpu_index = value;
+            } else if (arg == "--interval" || arg == "--gpu-interval" || arg == "--os-interval") {
+                unsigned value = 0;
+                if (!parseUnsigned(requireValue(arg.c_str()), value)) {
+                    throw std::runtime_error("invalid interval");
+                }
+                cfg.interval_ms = value;
+            } else if (arg == "--duration") {
+                int value = 0;
+                if (!parseInt(requireValue("--duration"), value)) {
+                    throw std::runtime_error("invalid --duration");
+                }
+                cfg.duration_sec = value;
+            } else if (arg == "--wait-for-start") {
+                cfg.wait_for_start = true;
+            } else if (arg == "--no-wait") {
+                cfg.wait_for_start = false;
+            } else if (arg == "--url") {
+                cfg.websocket_url = requireValue("--url");
+            } else if (arg == "--no-zstd") {
+                cfg.storage_config.use_zstd_compression = false;
+            } else {
+                throw std::runtime_error("unknown option: " + arg);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << std::endl;
+            usage(argv[0]);
             return 2;
         }
     }
 
-    SimpleOrchestrator orch;
-    bool ok = orch.run(cfg);
-    orch.stop();
-    return ok ? 0 : 1;
+    unified_monitor::SimpleOrchestrator orchestrator;
+    return orchestrator.run(cfg) ? 0 : 1;
 }

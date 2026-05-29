@@ -1,130 +1,62 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <map>
+#include <cstdio>
+#include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
-#include <unistd.h>
 
 #include "metrics_storage.hpp"
 #include "websocket_listener.hpp"
 
 namespace unified_monitor {
 
-using Clock = std::chrono::steady_clock;
-
-// ------------------------------ OSMetrics --------------------------
-struct OSMetrics {
-    // precise and sortable:
+struct EnergyMetrics {
     int64_t ts_unix_ns = 0;
-    pid_t   pid = 0;
-    long    mem_rss_kb = 0;
-    long    mem_vms_kb = 0;
-    double  cpu_percent = 0.0;
-    uint64_t disk_read_bytes = 0;
-    uint64_t disk_write_bytes = 0;
-    uint64_t net_recv_bytes = 0; // NOTE: system-wide deltas, not per-PID
-    uint64_t net_sent_bytes = 0; // NOTE: system-wide deltas, not per-PID
+    int zone_index = 0;
+    std::string zone_name;
+    uint64_t energy_delta_uj = 0;
+    uint64_t total_energy_uj = 0;
 };
 
-// ------------------------------ OSMetricsCollector --------------------------
-class OSMetricsCollector {
+class RAPLEnergyCollector {
 public:
-    OSMetricsCollector();
-    ~OSMetricsCollector();
+    RAPLEnergyCollector();
+    ~RAPLEnergyCollector();
 
-    void startMonitoring(const std::vector<pid_t>& pids, unsigned interval_ms);
-    void stopMonitoring();
-    std::vector<OSMetrics> getMetrics() const;
-
-    // Static method to collect metrics for a single PID
-    static OSMetrics collectForPid(pid_t pid);
+    bool isAvailable() const;
+    std::vector<EnergyMetrics> collect();
 
 private:
-    std::vector<pid_t> monitored_pids_;
-    unsigned interval_ms_ = 200;
-    std::atomic<bool> running_{false};
-    std::thread monitor_thread_;
-    mutable std::mutex metrics_mutex_;
-    std::vector<OSMetrics> metrics_;
+    struct Zone {
+        std::FILE* energy_fp = nullptr;
+        std::string name;
+        uint64_t max_range_uj = 0;
+        uint64_t prev_energy_uj = 0;
+        bool has_prev = false;
+    };
+
+    std::vector<Zone> zones_;
+    bool available_ = false;
 };
 
-// ------------------------------ GPUMetrics --------------------------
-struct GPUMetrics {
-    double monotonic_ts = 0.0;
-    int64_t ts_unix_ns = 0;
-    unsigned int gpu_index = 0;
-    unsigned int power_mw = 0;
-    unsigned int gpu_util_percent = 0;
-    unsigned int mem_util_percent = 0;
-    uint64_t mem_used_bytes = 0;
-    unsigned int sm_clock_mhz = 0;
-    unsigned int temperature_c = 0;
-    std::map<pid_t, unsigned int> pid_gpu_percent; // pid -> sm utilization %
+struct GpuPowerSample {
+    unsigned gpu_index = 0;
+    int64_t power_mw = -1;
 };
 
-struct GPUPidMetrics {
-    double monotonic_ts = 0.0;
-    int64_t ts_unix_ns = 0;
-    unsigned int gpu_index = 0;
-    pid_t pid = 0;
-    unsigned int sm_util_percent = 0;
-    unsigned int mem_util_percent = 0;
-};
-
-// ------------------------------ GPUMetricsCollector --------------------------
-class GPUMetricsCollector {
-public:
-    explicit GPUMetricsCollector(unsigned gpu_index);
-    ~GPUMetricsCollector();
-
-    void setEnablePidMetrics(bool enabled);
-    void startMonitoring(unsigned interval_ms, const std::vector<pid_t>& monitored_pids = {});
-    void stopMonitoring();
-    std::vector<GPUMetrics> getMetrics() const;
-    std::vector<GPUPidMetrics> getPidMetrics() const;
-
-private:
-    unsigned gpu_index_;
-    unsigned interval_ms_ = 100;
-    std::vector<pid_t> monitored_pids_;
-    std::atomic<bool> running_{false};
-    std::thread worker_;
-    mutable std::mutex mx_;
-    std::vector<GPUMetrics> samples_;
-    std::vector<GPUPidMetrics> pid_samples_;
-    std::atomic<bool> enable_pid_metrics_{true};
-};
-
-// ------------------------------ SimpleOrchestrator --------------------------
 class SimpleOrchestrator {
 public:
     struct Config {
-        // Process monitoring
-        std::vector<std::string> target_process_names = {"chrome", "native_client"};
-        std::string chrome_data_dir;
-        pid_t target_pid = 0; // If > 0, monitor specific PID instead of scanning
-
-        // Metrics intervals
-        unsigned gpu_index = 0;
-        unsigned os_monitor_interval_ms = 200;
-        unsigned gpu_monitor_interval_ms = 100;
-        int duration_sec = 0; // 0 = run until interrupted
-
-        // Output
+        std::string label;
         std::string output_dir = "./metrics";
+        unsigned gpu_index = 0;
+        unsigned interval_ms = 100;
+        int duration_sec = 0;
+        std::string websocket_url;
+        bool wait_for_start = false;
         MetricsStorage::Config storage_config;
-
-        // WebSocket connection (URL-based like main.cpp)
-        std::string websocket_url; // e.g., "wss://127.0.0.1:3001" or "ws://127.0.0.1:3001"
-        // Note: insecure connections (self-signed certs) are handled automatically in WebSocketListener
     };
 
     SimpleOrchestrator();
@@ -132,31 +64,18 @@ public:
 
     bool run(const Config& cfg);
     void stop();
-    void setStorageConfig(const MetricsStorage::Config& config);
-
-    // Process scanning utilities
-    static std::vector<pid_t> getPidsByName(const std::string& process_name);
-    static std::vector<pid_t> scanForProcesses(const std::vector<std::string>& process_names);
-    static std::vector<pid_t> scanForProcesses(const std::vector<std::string>& process_names, const std::string& chrome_data_dir);
-    static std::string getProcessCmdline(pid_t pid);
-    static bool hasChromeDataDir(pid_t pid, const std::string& data_dir);
 
 private:
     void setupWebSocket(const Config& cfg);
-    void startMetricsCollection(const Config& cfg);
-    void stopMetricsCollection();
-    void flushMetrics();
-    void exportSummary(const Config& config);
+    void sampleOnce(const Config& cfg, uint64_t sample_index);
+    GpuPowerSample sampleGpu(unsigned gpu_index);
 
-    std::unique_ptr<OSMetricsCollector> os_collector_;
-    std::unique_ptr<GPUMetricsCollector> gpu_collector_;
+    std::unique_ptr<RAPLEnergyCollector> rapl_collector_;
     std::unique_ptr<MetricsStorage> storage_;
     std::unique_ptr<WebSocketListener> websocket_listener_;
 
     std::atomic<bool> running_{false};
-    std::atomic<bool> metrics_collecting_{false};
-    std::vector<pid_t> monitored_pids_;
-    bool enable_gpu_pid_metrics_ = true;
+    std::atomic<bool> sampling_{false};
 };
 
 } // namespace unified_monitor

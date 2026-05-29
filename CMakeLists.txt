@@ -44,7 +44,7 @@ endif()
 set(SRCS
     simple_main.cpp
     metrics_storage.cpp
-    os_metrics_linux.cpp
+    rapl_energy_linux.cpp
     websocket_listener.cpp
 )
 

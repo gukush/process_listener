@@ -1,124 +1,76 @@
 #pragma once
 
 #include <orc/OrcFile.hh>
-#include <orc/Reader.hh>
 #include <orc/Writer.hh>
+
+#include <atomic>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <chrono>
-#include <mutex>
-#include <atomic>
 
 namespace unified_monitor {
 
-// Forward declarations
-struct OSMetrics;
-struct GPUMetrics;
-struct GPUPidMetrics;
+struct UnifiedMetricSample {
+    int64_t ts_unix_ns = 0;
+    uint64_t sample_index = 0;
+    std::string label;
+    unsigned gpu_index = 0;
+    int64_t gpu_power_mw = -1;
+    int rapl_zone_index = -1;
+    std::string rapl_zone_name;
+    uint64_t cpu_energy_delta_uj = 0;
+    uint64_t cpu_energy_total_uj = 0;
+};
 
-// Efficient metrics storage using Apache ORC with Zstd compression
 class MetricsStorage {
 public:
     struct Config {
         std::string output_dir = "./metrics";
-        size_t max_rows_per_file = 500000;  // Roll files every ~500k rows
-        std::chrono::minutes max_file_age{5}; // Roll files every 5 minutes
+        std::string label;
         bool use_zstd_compression = true;
-        int zstd_compression_level = 3; // Good balance of speed vs compression
-        bool enable_gpu_pid_metrics = true;
     };
 
-    // Fix: Use default constructor approach instead of default parameter with Config{}
     explicit MetricsStorage(const Config& config);
-    MetricsStorage(); // Default constructor that uses default Config
+    MetricsStorage();
     ~MetricsStorage();
 
-    // Initialize storage and create output directory
     bool initialize();
-
-    // Update storage configuration (must be called before initialize())
     void setStorageConfig(const Config& config);
-
-    // Add metrics samples (thread-safe)
-    void addOSMetrics(const std::vector<OSMetrics>& metrics);
-    void addGPUMetrics(const std::vector<GPUMetrics>& metrics);
-    void addGPUPidMetrics(const std::vector<GPUPidMetrics>& metrics);
-
-    // Force flush current data to disk
+    void addSamples(const std::vector<UnifiedMetricSample>& samples);
     void flush();
-
-    // Force flush and close all files (for clean shutdown)
     void flushAndClose();
 
-    // Get statistics about stored data
     struct StorageStats {
-        size_t total_os_samples = 0;
-        size_t total_gpu_samples = 0;
-        size_t total_gpu_pid_samples = 0;
-        size_t os_files_written = 0;
-        size_t gpu_files_written = 0;
-        size_t gpu_pid_files_written = 0;
-        std::string last_os_file;
-        std::string last_gpu_file;
-        std::string last_gpu_pid_file;
+        size_t total_samples = 0;
+        size_t files_written = 0;
+        std::string filename;
     };
     StorageStats getStats() const;
 
 private:
-    // Internal file management
     struct FileWriter {
         std::unique_ptr<orc::Writer> writer;
         std::unique_ptr<orc::OutputStream> output;
+        std::unique_ptr<orc::Type> schema;
         std::string filename;
         size_t row_count = 0;
-        std::chrono::steady_clock::time_point created_at;
-        std::unique_ptr<orc::Type> schema;
     };
 
-    // OS metrics storage
-    void createOSFile();
-    void flushOSData();
-    void addOSMetricsToBatch(const std::vector<OSMetrics>& metrics);
+    void createFile();
+    void flushData();
+    void closeFile();
+    std::string generateFilename() const;
+    std::unique_ptr<orc::Type> createSchema() const;
+    void writeBatch(orc::Writer* writer, const std::vector<UnifiedMetricSample>& samples);
 
-    // GPU metrics storage
-    void createGPUFile();
-    void flushGPUData();
-    void addGPUMetricsToBatch(const std::vector<GPUMetrics>& metrics);
-    void createGPUPidFile();
-    void flushGPUPidData();
-    void addGPUPidMetricsToBatch(const std::vector<GPUPidMetrics>& metrics);
-
-    // Common file management
-    std::string generateFilename(const std::string& prefix, const std::string& extension = ".orc");
-    bool shouldRollFile(const FileWriter& writer) const;
-    void closeFile(FileWriter& writer);
-
-    // ORC schema definitions
-    std::unique_ptr<orc::Type> createOSSchema();
-    std::unique_ptr<orc::Type> createGPUSchema();
-    std::unique_ptr<orc::Type> createGPUPidSchema();
-
-    // Convert metrics to ORC batches
-    void writeOSBatch(orc::Writer* writer, const std::vector<OSMetrics>& metrics);
-    void writeGPUBatch(orc::Writer* writer, const std::vector<GPUMetrics>& metrics);
-    void writeGPUPidBatch(orc::Writer* writer, const std::vector<GPUPidMetrics>& metrics);
-
-private:
     Config config_;
-
-    // OS metrics storage - Fix: make mutexes mutable for const methods
-    mutable std::mutex os_mutex_;
-    std::unique_ptr<FileWriter> os_writer_;
-    std::vector<OSMetrics> os_buffer_;
+    mutable std::mutex mutex_;
+    std::unique_ptr<FileWriter> file_;
+    std::vector<UnifiedMetricSample> buffer_;
     StorageStats stats_;
-
-    // GPU metrics storage
-    mutable std::mutex gpu_mutex_;
-    std::unique_ptr<FileWriter> gpu_writer_;
-    std::vector<GPUMetrics> gpu_buffer_;
-    std::unique_ptr<FileWriter> gpu_pid_writer_;
-    std::vector<GPUPidMetrics> gpu_pid_buffer_;
+    std::atomic<bool> closed_{false};
 };
 
 } // namespace unified_monitor
