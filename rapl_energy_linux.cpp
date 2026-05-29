@@ -3,12 +3,11 @@
 // Discovers zones under /sys/class/powercap/intel-rapl* and reports deltas
 // in microjoules, handling counter wrap-around via max_energy_range_uj.
 //
-// IMPORTANT: sysfs virtual files are kept open across samples and rewound
-// on each read to avoid process-spawn overhead (no system/cat calls).
+// IMPORTANT: sysfs virtual files are reopened on each sample. Keeping
+// energy_uj open through stdio can return stale values on some systems.
 
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -20,15 +19,6 @@
 namespace unified_monitor {
 
 namespace {
-
-static bool readUint64FromStream(FILE* fp, uint64_t& out) {
-    if (!fp) return false;
-    std::rewind(fp);
-    unsigned long long v = 0;
-    if (std::fscanf(fp, "%llu", &v) != 1) return false;
-    out = static_cast<uint64_t>(v);
-    return true;
-}
 
 static bool readUint64FromPath(const std::string& path, uint64_t& out) {
     std::ifstream f(path);
@@ -69,23 +59,15 @@ RAPLEnergyCollector::RAPLEnergyCollector() {
         const std::string energy_path = entry.path() / "energy_uj";
         if (!std::filesystem::exists(energy_path)) continue;
 
-        // Open the energy counter file once and keep it alive
-        FILE* energy_fp = std::fopen(energy_path.c_str(), "r");
-        if (!energy_fp) {
-            std::cout << "[RAPL] Zone " << dirname << " energy_uj not readable (permissions?)" << std::endl;
-            continue;
-        }
-
         // Verify we can actually read it
         uint64_t test_val = 0;
-        if (!readUint64FromStream(energy_fp, test_val)) {
-            std::fclose(energy_fp);
+        if (!readUint64FromPath(energy_path, test_val)) {
             std::cout << "[RAPL] Zone " << dirname << " energy_uj read failed" << std::endl;
             continue;
         }
 
         Zone z;
-        z.energy_fp = energy_fp;
+        z.energy_path = energy_path;
         z.name = readStringFromFile(entry.path() / "name");
         if (z.name.empty()) z.name = dirname;
 
@@ -113,14 +95,7 @@ RAPLEnergyCollector::RAPLEnergyCollector() {
     }
 }
 
-RAPLEnergyCollector::~RAPLEnergyCollector() {
-    for (auto& z : zones_) {
-        if (z.energy_fp) {
-            std::fclose(z.energy_fp);
-            z.energy_fp = nullptr;
-        }
-    }
-}
+RAPLEnergyCollector::~RAPLEnergyCollector() = default;
 
 bool RAPLEnergyCollector::isAvailable() const {
     return available_;
@@ -137,10 +112,10 @@ std::vector<EnergyMetrics> RAPLEnergyCollector::collect() {
 
     for (size_t i = 0; i < zones_.size(); ++i) {
         Zone& z = zones_[i];
-        if (!z.energy_fp) continue;
+        if (z.energy_path.empty()) continue;
 
         uint64_t current = 0;
-        if (!readUint64FromStream(z.energy_fp, current)) {
+        if (!readUint64FromPath(z.energy_path, current)) {
             continue; // skip if unreadable this time
         }
 

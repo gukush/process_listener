@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <cstdio>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -30,7 +29,7 @@ public:
 
 private:
     struct Zone {
-        std::FILE* energy_fp = nullptr;
+        std::string energy_path;
         std::string name;
         uint64_t max_range_uj = 0;
         uint64_t prev_energy_uj = 0;
