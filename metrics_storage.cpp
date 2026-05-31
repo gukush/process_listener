@@ -1,5 +1,6 @@
 #include "metrics_storage.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <filesystem>
@@ -27,8 +28,10 @@ std::string sanitizeLabel(const std::string& label) {
 
 } // namespace
 
-MetricsStorage::MetricsStorage(const Config& config) : config_(config) {
-    buffer_.reserve(4096);
+MetricsStorage::MetricsStorage(const Config& config)
+    : config_(config),
+      last_flush_time_(std::chrono::steady_clock::now()) {
+    buffer_.reserve(std::min<size_t>(config_.max_buffered_samples, 4096));
 }
 
 MetricsStorage::MetricsStorage() : MetricsStorage(Config{}) {}
@@ -40,6 +43,7 @@ MetricsStorage::~MetricsStorage() {
 void MetricsStorage::setStorageConfig(const Config& config) {
     std::lock_guard<std::mutex> lock(mutex_);
     config_ = config;
+    buffer_.reserve(std::min<size_t>(config_.max_buffered_samples, 4096));
 }
 
 bool MetricsStorage::initialize() {
@@ -57,8 +61,21 @@ void MetricsStorage::addSamples(const std::vector<UnifiedMetricSample>& samples)
     if (samples.empty()) return;
 
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool was_empty = buffer_.empty();
+    const auto now = std::chrono::steady_clock::now();
     buffer_.insert(buffer_.end(), samples.begin(), samples.end());
-    if (buffer_.size() >= 1024) {
+    if (was_empty) {
+        last_flush_time_ = now;
+    }
+
+    const bool size_limit_reached = config_.max_buffered_samples > 0 &&
+                                    buffer_.size() >= config_.max_buffered_samples;
+    const bool time_limit_reached = config_.max_flush_interval.count() > 0 &&
+                                    now - last_flush_time_ >= config_.max_flush_interval;
+    if (time_limit_reached) {
+        flushData();
+        closeFile();
+    } else if (size_limit_reached) {
         flushData();
     }
 }
@@ -82,7 +99,8 @@ MetricsStorage::StorageStats MetricsStorage::getStats() const {
 }
 
 void MetricsStorage::createFile() {
-    if (file_) return;
+    if (file_ && file_->writer) return;
+    file_.reset();
 
     auto schema = createSchema();
     auto filename = generateFilename();
@@ -118,6 +136,7 @@ void MetricsStorage::flushData() {
     file_->row_count += buffer_.size();
     stats_.total_samples += buffer_.size();
     buffer_.clear();
+    last_flush_time_ = std::chrono::steady_clock::now();
 }
 
 void MetricsStorage::closeFile() {
@@ -129,9 +148,10 @@ void MetricsStorage::closeFile() {
             file_->writer.reset();
         }
         file_->output.reset();
-        stats_.files_written = 1;
+        stats_.files_written += 1;
         std::cout << "[MetricsStorage] Closed " << file_->filename
                   << " (" << file_->row_count << " rows)" << std::endl;
+        file_.reset();
     } catch (const std::exception& e) {
         std::cerr << "[MetricsStorage] close failed: " << e.what() << std::endl;
     }

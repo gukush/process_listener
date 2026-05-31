@@ -246,6 +246,8 @@ void usage(const char* argv0) {
         << "  --duration SEC          Stop after SEC seconds (default: until signal)\n"
         << "  --wait-for-start        Wait for WebSocket metrics:start before sampling\n"
         << "  --url URL               WebSocket URL used with --wait-for-start\n"
+        << "  --max-buffered-samples N Flush after N buffered rows (default: 100000)\n"
+        << "  --flush-interval-sec N  Finalize current ORC file every N seconds (default: 300)\n"
         << "  --no-zstd               Disable ORC Zstd compression\n"
         << "  --help                  Show this help\n";
 }
@@ -268,6 +270,18 @@ bool parseInt(const std::string& text, int& out) {
         int value = std::stoi(text, &pos, 10);
         if (pos != text.size()) return false;
         out = value;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool parseSize(const std::string& text, size_t& out) {
+    try {
+        size_t pos = 0;
+        unsigned long long value = std::stoull(text, &pos, 10);
+        if (pos != text.size()) return false;
+        out = static_cast<size_t>(value);
         return true;
     } catch (...) {
         return false;
@@ -324,6 +338,18 @@ int main(int argc, char** argv) {
                 cfg.wait_for_start = false;
             } else if (arg == "--url") {
                 cfg.websocket_url = requireValue("--url");
+            } else if (arg == "--max-buffered-samples") {
+                size_t value = 0;
+                if (!parseSize(requireValue("--max-buffered-samples"), value)) {
+                    throw std::runtime_error("invalid --max-buffered-samples");
+                }
+                cfg.storage_config.max_buffered_samples = value;
+            } else if (arg == "--flush-interval-sec") {
+                unsigned value = 0;
+                if (!parseUnsigned(requireValue("--flush-interval-sec"), value)) {
+                    throw std::runtime_error("invalid --flush-interval-sec");
+                }
+                cfg.storage_config.max_flush_interval = std::chrono::seconds(value);
             } else if (arg == "--no-zstd") {
                 cfg.storage_config.use_zstd_compression = false;
             } else {

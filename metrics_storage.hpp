@@ -4,6 +4,8 @@
 #include <orc/Writer.hh>
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -30,6 +32,8 @@ public:
         std::string output_dir = "./metrics";
         std::string label;
         bool use_zstd_compression = true;
+        size_t max_buffered_samples = 100000;
+        std::chrono::milliseconds max_flush_interval{std::chrono::minutes(5)};
     };
 
     explicit MetricsStorage(const Config& config);
@@ -70,6 +74,7 @@ private:
     std::unique_ptr<FileWriter> file_;
     std::vector<UnifiedMetricSample> buffer_;
     StorageStats stats_;
+    std::chrono::steady_clock::time_point last_flush_time_;
     std::atomic<bool> closed_{false};
 };
 
